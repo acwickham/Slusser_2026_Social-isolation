@@ -1,0 +1,215 @@
+---
+title: "SCFA_analysis"
+author: "Amelia Slusser"
+date: "2026-06-15"
+output: html_document
+---
+```{r}
+library(tidyverse)
+library(ggpubr)
+```
+
+Create the data frame
+```{r}
+# Male
+acid_df_male <- data.frame(
+  Acid = c("Acetic acid", "Propanoic acid", "Butanoic acid"),
+  SCFA_2R = c(30.77341192, 4.311783052, 17.65337896),
+  SCFA_2L = c(32.56562304, 4.505201710, 15.13776941),
+  SCFA_2N = c(27.12212407, 5.832733405, 15.73484547),
+  SCFA_4R = c(28.32625100, 3.874803593, 13.50260895),
+  SCFA_4L = c(43.06492747, 4.534859619, 17.17340486),
+  SCFA_4N = c(62.09566630, 5.832733405, 25.57701063),
+  SCFA_8 = c(18.35740908, 2.950271736, 7.149994563),
+  SCFA_9 = c(27.91669927, 4.033582377, 12.56273199),
+  SCFA_10 = c(36.06053286, 4.153475649, 14.41951245),
+  SCFA_14 = c(35.04559781, 4.511368808, 23.65483562),
+  SCFA_15 = c(42.78184810, 4.783494368, 13.82546335),
+  SCFA_16 = c(44.41105699, 4.881566159, 22.10643895)
+)
+
+# Female
+acid_df_female <- data.frame(
+  Acid = c("Acetic acid", "Propanoic acid", "Butanoic acid"),
+  SCFA_1R = c(50.4441707, 6.393796959, 29.65419381),
+  SCFA_1L = c(54.4072584, 6.536856053, 31.15662021),
+  SCFA_1N = c(47.87936608, 5.725631541, 30.38061478),
+  SCFA_3R = c(54.48077598, 5.872126656, 20.14642072),
+  SCFA_3L = c(38.49203531, 5.309342005, 15.72054536),
+  SCFA_3N = c(45.22570221, 5.577567228, 24.2285883),
+  SCFA_5 = c(45.25043714, 6.075897099, 18.13886282),
+  SCFA_6 = c(33.12207867, 5.901728097, 13.24623953),
+  SCFA_7 = c(35.57748589, 5.320871359, 14.45610848),
+  SCFA_11 = c(49.69813036, 5.844811114, 21.14085906),
+  SCFA_12 = c(54.71039006, 4.713661281, 22.73096207),
+  SCFA_13 = c(69.34386146, 6.327768089, 29.40061417)
+)
+```
+
+Convert to uM
+```{r}
+# Molecular weights in g/mol
+mw_df <- data.frame(
+  Acid = c("Acetic acid", "Propanoic acid", "Butanoic acid"),
+  Molecular_weight = c(
+    60.052,  # Acetic acid
+    74.079,  # Propanoic acid
+    88.106   # Butanoic acid
+  )
+)
+
+# Convert from wide to long format and convert ppm to µM male
+acid_long_male <- acid_df_male %>%
+  pivot_longer(
+    cols = -Acid,
+    names_to = "Sample",
+    values_to = "ppm"
+  ) %>%
+  left_join(mw_df, by = "Acid") %>%
+  mutate(
+    uM = (ppm / Molecular_weight) * 1000,
+    
+    Group = case_when(
+      str_detect(Sample, "^Con") ~ "Control",
+      str_detect(Sample, "^Strs") ~ "Stress"
+    ),
+    
+    Group = factor(Group, levels = c("Control", "Stress")),
+    
+    Acid = factor(
+      Acid,
+      levels = c("Acetic acid", "Propanoic acid", "Butanoic acid")
+    )
+  )
+
+# Female
+acid_long_female <- acid_df_female %>%
+  pivot_longer(
+    cols = -Acid,
+    names_to = "Sample",
+    values_to = "ppm"
+  ) %>%
+  left_join(mw_df, by = "Acid") %>%
+  mutate(
+    uM = (ppm / Molecular_weight) * 1000,
+    
+    Group = case_when(
+      str_detect(Sample, "^Con") ~ "Control",
+      str_detect(Sample, "^Strs") ~ "Stress"
+    ),
+    
+    Group = factor(Group, levels = c("Control", "Stress")),
+    
+    Acid = factor(
+      Acid,
+      levels = c("Acetic acid", "Propanoic acid", "Butanoic acid")
+    )
+  )
+```
+
+Plot all as faceted boxplots
+```{r}
+# Colors
+group_colors <- c(
+  "Control" = "#4D4D4D",
+  "Stress"  = "#FE8A13"
+)
+
+# Box-and-whisker plot using µM values male
+acid_boxplot_male <- ggplot(acid_long_male, aes(x = Group, y = uM, fill = Group)) +
+  geom_boxplot(
+    width = 0.6,
+    alpha = 0.85,
+    color = "black",
+    outlier.shape = NA
+  ) +
+  geom_jitter(
+    width = 0.12,
+    size = 2.5,
+    shape = 21,
+    color = "black",
+    alpha = 0.9
+  ) +
+  facet_wrap(~ Acid, scales = "free_y") +
+  scale_fill_manual(values = group_colors) +
+  stat_compare_means(
+    comparisons = list(c("Control", "Stress")),
+    method = "wilcox.test",
+    label = "p.signif",
+    size = 5
+  ) +
+  theme_classic(base_size = 14) +
+  labs(
+    x = NULL,
+    y = expression("Concentration ("*mu*"M)"),
+    fill = NULL
+  ) +
+  theme(
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold", size = 13),
+    axis.text.x = element_text(size = 12, color = "black"),
+    axis.text.y = element_text(size = 11, color = "black"),
+    axis.title.y = element_text(size = 13),
+    legend.position = "none"
+  )
+acid_boxplot_male
+
+# Box-and-whisker plot using µM values female
+acid_boxplot_female <- ggplot(acid_long_female, aes(x = Group, y = uM, fill = Group)) +
+  geom_boxplot(
+    width = 0.6,
+    alpha = 0.85,
+    color = "black",
+    outlier.shape = NA
+  ) +
+  geom_jitter(
+    width = 0.12,
+    size = 2.5,
+    shape = 21,
+    color = "black",
+    alpha = 0.9
+  ) +
+  facet_wrap(~ Acid, scales = "free_y") +
+  scale_fill_manual(values = group_colors) +
+  stat_compare_means(
+    comparisons = list(c("Control", "Stress")),
+    method = "wilcox.test",
+    label = "p.signif",
+    size = 5
+  ) +
+  theme_classic(base_size = 14) +
+  labs(
+    x = NULL,
+    y = expression("Concentration ("*mu*"M)"),
+    fill = NULL
+  ) +
+  theme(
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold", size = 13),
+    axis.text.x = element_text(size = 12, color = "black"),
+    axis.text.y = element_text(size = 11, color = "black"),
+    axis.title.y = element_text(size = 13),
+    legend.position = "none"
+  )
+acid_boxplot_female
+```
+
+Save plot
+```{r}
+ggsave(
+  filename = "acid_boxplot_uM_male.pdf",
+  plot = acid_boxplot_male,
+  width = 8,
+  height = 4,
+  units = "in"
+)
+
+ggsave(
+  filename = "acid_boxplot_uM_female.pdf",
+  plot = acid_boxplot_female,
+  width = 8,
+  height = 4,
+  units = "in"
+)
+```
+

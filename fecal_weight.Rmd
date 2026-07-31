@@ -1,0 +1,177 @@
+---
+title: "Fecal weight analysis"
+author: "Amelia Slusser"
+date: "2026-07-30"
+output: html_document
+---
+```{r}
+# Load packages
+library(tidyverse)
+```
+
+Prepare and plot data (male)
+```{r}
+# Read data
+fecal <- data.frame(
+  Week = c("W1","W1","W2","W2","W2","W3","W3","W3",
+           "W4","W4","W4","W5","W5","W5","W6","W6","W6"),
+  Control_m_1 = c(356,237.7,451.8,59,363.1,394.8,332.3,284.8,
+                  372.5,371.7,370.9,205.5,231.6,399.6,457.9,228.3,610.1),
+  Control_m_2 = c(386.5,220.1,378.4,181,358.1,442.1,363.7,276,
+                  439.1,220.9,439.6,413.7,293.9,280,250.9,245.9,139.4),
+  Stress_m_1 = c(268.4,391,173.1,141.8,268.8,413.7,284.2,330.2,
+                 382.3,198.4,435.1,580.3,309.6,357.9,423.4,224.4,338.8),
+  Stress_m_2 = c(372.1,324.8,526.9,471.3,432.1,501.4,453.4,446.3,
+                 435.7,263.9,596.9,472.6,334.4,365,530,358.3,436.2)
+)
+
+# Convert to long format
+fecal_long <- fecal %>%
+  pivot_longer(-Week,
+               names_to = "Sample",
+               values_to = "Weight") %>%
+  mutate(Group = ifelse(grepl("Control", Sample), "Control", "Stress"))
+
+# Order weeks
+fecal_long$Week <- factor(fecal_long$Week,
+                          levels = c("W1","W2","W3","W4","W5","W6"))
+
+# Calculate summary statistics
+summary_df <- fecal_long %>%
+  group_by(Week, Group) %>%
+  summarise(
+    Mean = mean(Weight),
+    SD = sd(Weight),
+    SE = SD / sqrt(n()),
+    n = n(),
+    .groups = "drop"
+  )
+
+# Plot
+male_plot <- ggplot(fecal_long,
+       aes(x = Week, y = Weight, color = Group)) +
+  geom_jitter(position = position_jitter(width = 0.08),
+              alpha = 0.5,
+              size = 2) +
+  stat_summary(aes(group = Group),
+               fun = mean,
+               geom = "line",
+               linewidth = 1.2,
+               position = position_dodge(width = 0.2)) +
+  stat_summary(aes(group = Group),
+               fun = mean,
+               geom = "point",
+               size = 3,
+               position = position_dodge(width = 0.2)) +
+  stat_summary(aes(group = Group),
+               fun.data = mean_se,
+               geom = "errorbar",
+               width = 0.15,
+               position = position_dodge(width = 0.2)) +
+  scale_color_manual(values = c(
+    "Control" = "#4D4D4D",
+    "Stress" = "#FE8A13"
+  )) +
+  labs(
+    x = "Week",
+    y = "Fecal weight (mg)",
+    color = "Group"
+  ) +
+  theme_classic(base_size = 25)
+# Display plot
+male_plot
+```
+
+Save
+```{r}
+ggsave(
+  filename = "male_FecalWeight_byWeek.pdf",
+  plot = male_plot,
+  width = 10,
+  height = 5
+)
+```
+
+Prepare and plot data (female)
+```{r}
+# Read data
+fecal <- data.frame(
+  Week = c("W1","W1","W2","W2","W2","W3","W3","W3",
+           "W4","W4","W4","W5","W5","W5","W6","W6","W6"),
+  Control_f_1 = c(445.8,227,430.7,181.9,403,428.6,226,263.5,
+                  367.5,470.8,526,427,196.8,223.2,353.5,231.2,198),
+  Control_f_2 = c(196.8,283.6,266.9,267.3,228,593.7,456.1,244.8,
+                  300.5,177,314.1,429.5,248.1,297.6,248.9,259,243.6),
+  Stress_f_1 = c(165,344.7,160.4,334.8,189.8,401.7,247.6,359.8,
+                 493.3,304.9,370.7,241.8,149.7,282.5,314.8,411.5,230.7),
+  Stress_f_2 = c(213.2,82.2,232.4,102.1,224.6,383.3,216.9,220.2,
+                 311.2,188.8,242.4,254.3,186.7,241.1,98.4,258.5,156.9)
+)
+
+# Convert to long format
+fecal_long <- fecal %>%
+  pivot_longer(-Week,
+               names_to = "Sample",
+               values_to = "Weight") %>%
+  mutate(Group = ifelse(grepl("Control", Sample), "Control", "Stress"))
+
+# Order weeks
+fecal_long$Week <- factor(
+  fecal_long$Week,
+  levels = c("W1","W2","W3","W4","W5","W6")
+)
+
+# Plot
+female_plot <- ggplot(fecal_long,
+                      aes(x = Week, y = Weight, color = Group)) +
+  geom_jitter(
+    position = position_jitter(width = 0.08),
+    alpha = 0.55,
+    size = 2
+  ) +
+  stat_summary(
+    aes(group = Group),
+    fun = mean,
+    geom = "line",
+    linewidth = 1.2,
+    position = position_dodge(width = 0.20)
+  ) +
+  stat_summary(
+    aes(group = Group),
+    fun = mean,
+    geom = "point",
+    size = 3,
+    position = position_dodge(width = 0.20)
+  ) +
+  stat_summary(
+    aes(group = Group),
+    fun.data = mean_se,
+    geom = "errorbar",
+    width = 0.15,
+    linewidth = 0.8,
+    position = position_dodge(width = 0.20)
+  ) +
+  scale_color_manual(values = c(
+    "Control" = "#4D4D4D",
+    "Stress" = "#FE8A13"
+  )) +
+  labs(
+    x = "Week",
+    y = "Fecal weight (mg)",
+    color = "Group"
+  ) +
+  theme_classic(base_size = 25)
+
+# Display plot
+female_plot
+```
+
+Save
+```{r}
+ggsave(
+  filename = "female_FecalWeight_byWeek.pdf",
+  plot = female_plot,
+  width = 10,
+  height = 5
+)
+```
