@@ -1,0 +1,2324 @@
+---
+title: "16S_analysis_&_visualization"
+author: "Amelia Slusser"
+date: "2026-05-07"
+output: html_document
+---
+Load packages
+```{r}
+library(dplyr)
+library(purrr)
+library(readr)
+library(tidyr)
+library(phyloseq)
+library(stringr)
+library(tibble)
+library(ggplot2)
+library(scales)
+library(viridis)
+library(RColorBrewer)
+library(vegan)
+library(ape)
+library(Maaslin2)
+library(rlang)
+library(microbiome)
+library(ggh4x)
+library(writexl)
+```
+
+Load in the data
+```{r}
+# List all EMU output files
+files <- list.files(base_dir, pattern = ".tsv$", full.names = TRUE)
+samples <- gsub(".tsv", "", basename(files))
+
+# Loop through files and rename estimated counts column
+for (file in files) {
+  
+  df <- read.delim(file, sep = "\t", check.names = FALSE)
+  
+  # Rename the column if it exists
+  colnames(df)[colnames(df) == "estimated counts"] <- "estimated_counts"
+  
+  # Overwrite the file with updated column name
+  write.table(df,
+              file = file,
+              sep = "\t",
+              quote = FALSE,
+              row.names = FALSE)
+}
+
+#upload meta data to merge with samples and reads
+meta <- read.table("meta_data.txt", header = TRUE, sep = "\t", stringsAsFactors = FALSE)
+```
+
+Clean up the data
+```{r}
+# Read all files into a single long-format data frame (memory-efficient)
+long_df1 <- map2_dfr(files, samples, function(file, samp) {
+  read_tsv(file, col_types = cols()) %>%
+    select(tax_id, lineage, estimated_counts) %>%
+    mutate(sample = samp)
+})
+# Remove unclassified/unmapped
+long_df2 <- long_df1 %>%
+  filter(!tax_id %in% c("mapped_unclassified", "unmapped"))
+# Replace NA with 0
+long_df2$estimated_counts[is.na(long_df2$estimated_counts)] <- 0
+# Keep only one row per tax_id per sample (first occurrence)
+long_df3 <- long_df2 %>%
+  distinct(tax_id, lineage, sample, .keep_all = TRUE)
+# Convert to wide format (samples as columns)
+merged_df <- long_df3 %>%
+  pivot_wider(names_from = sample, values_from = estimated_counts, values_fill = 0)
+# Optional: sort by tax_id
+merged_df <- merged_df %>% arrange(tax_id)
+#collapse repeated taxIDs by deleting any repeated rows
+merged_df_unique <- merged_df %>%
+  distinct(tax_id, .keep_all = TRUE)
+# Extract abundance columns
+counts_cols <- setdiff(names(merged_df_unique), c("tax_id", "lineage"))
+# Step 2: Create OTU matrix
+otu_mat <- as.matrix(merged_df_unique %>% select(-tax_id, -lineage))
+# Step 3: Assign rownames from unique tax_ids
+rownames(otu_mat) <- merged_df_unique$tax_id
+```
+
+Relative Abundance for MaAsLin2 analysis
+```{r}
+# Read all files into a single long-format data frame (memory-efficient)
+a_long_df1 <- map2_dfr(files, samples, function(file, samp) {
+  read_tsv(file, col_types = cols()) %>%
+    select(tax_id, lineage, abundance) %>%
+    mutate(sample = samp)
+})
+# Remove unclassified/unmapped
+a_long_df2 <- a_long_df1 %>%
+  filter(!tax_id %in% c("mapped_unclassified", "unmapped"))
+# Replace NA with 0
+a_long_df2$abundance[is.na(a_long_df2$abundance)] <- 0
+# Keep only one row per tax_id per sample (first occurrence)
+a_long_df3 <- a_long_df2 %>%
+  distinct(tax_id, lineage, sample, .keep_all = TRUE)
+# Convert to wide format (samples as columns)
+a_merged_df <- a_long_df3 %>%
+  pivot_wider(names_from = sample, values_from = abundance, values_fill = 0)
+# Optional: sort by tax_id
+a_merged_df <- a_merged_df %>% arrange(tax_id)
+#collapse repeated taxIDs by deleting any repeated rows
+a_merged_df_unique <- a_merged_df %>%
+  distinct(tax_id, .keep_all = TRUE)
+# Extract abundance columns
+a_counts_cols <- setdiff(names(a_merged_df_unique), c("tax_id", "lineage"))
+# Step 2: Create OTU matrix
+a_otu_mat <- as.matrix(a_merged_df_unique %>% select(-tax_id, -lineage))
+# Step 3: Assign rownames from unique tax_ids
+rownames(a_otu_mat) <- a_merged_df_unique$tax_id
+```
+
+Save merged files
+```{r}
+write_tsv(merged_df_unique, "merged_df_final.tsv")
+```
+
+Save merged files (relative abundance)
+```{r}
+write_tsv(a_merged_df_unique, "merged_df_final_abundance.tsv")
+```
+
+Create a phyloseq object
+```{r}
+# Define the 6 (mouse database) main ranks
+ranks <- c("Kingdom","Phylum","Order","Family","Genus","Species")
+
+tax_mat <- merged_df_unique %>%
+  select(tax_id, lineage) %>%
+  mutate(
+    # Split lineage by ';' and remove any empty elements
+    lineage_split = map(lineage, ~ {
+      pieces <- strsplit(.x, ";")[[1]]
+      pieces <- pieces[pieces != ""]   # remove empty strings
+      # Take last 6 elements if longer
+      vals <- tail(pieces, 6)
+      # Pad with NA on left if shorter than 6
+      if(length(vals) < 6) vals <- c(rep(NA, 6 - length(vals)), vals)
+      rev(vals)  # reverse so Kingdom is first
+    })
+  ) %>%
+  
+  # Expand list-column into separate columns
+  unnest_wider(lineage_split, names_sep = "_") %>%
+  rename_with(~ ranks, starts_with("lineage_split_")) %>%
+  mutate(across(everything(), ~ trimws(.))) %>%
+  as.data.frame()
+
+tax_mat <- tax_mat %>%
+  select(-lineage)
+
+tax_mat <- tax_mat %>%
+  mutate(Species = ifelse(
+    !is.na(Species) & !str_detect(Species, "\\s"),
+    paste0(Species, " sp."),
+    Species
+  ))
+
+rownames(tax_mat) <- merged_df_unique$tax_id
+
+tax_mat_phy <- as.matrix(tax_mat)
+
+# Set rownames to tax_id
+rownames(otu_mat) <- merged_df_unique$tax_id
+
+tax_mat_phy <- as.matrix(tax_mat)
+
+# Prepare metadata
+# Set sample_ID as rownames (for phyloseq)
+meta <- meta %>% column_to_rownames("sample_ID")
+
+# Check order against your OTU matrix to make sure they match
+all(rownames(meta) %in% colnames(otu_mat))  # should be TRUE
+
+# Check that rownames for OTU and TAX are identical
+identical(
+  rownames(otu_mat),
+  rownames(tax_mat)
+)
+
+#now make your phyloseq object
+OTU <- otu_table(otu_mat, taxa_are_rows = TRUE)   # TRUE if rows are taxa, FALSE if samples
+TAX <- tax_table(as.matrix(tax_mat_phy))
+META <- sample_data(meta)
+
+ps <- phyloseq(OTU, TAX, META)
+
+#check a few things 
+ps
+sample_names(ps)[1:5]
+taxa_names(ps)[1:5]
+sample_data(ps)[1:5, ]
+
+ntaxa(ps)
+```
+
+Determine read depth of each sample as quality control measure
+```{r}
+# ============================================================
+# DETERMINE READ DEPTH OF EACH SAMPLE BY SEX
+# ============================================================
+
+# Get total sequencing depth for every sample
+sums <- sample_sums(ps)
+
+# Overall summary
+summary(sums)
+hist(
+  sums,
+  breaks = 50,
+  main = "Sequencing depth per sample",
+  xlab = "Reads"
+)
+
+# Overall useful numbers
+min(sums)
+median(sums)
+quantile(sums, probs = c(0.05, 0.10, 0.25))
+
+
+# ------------------------------------------------------------
+# Create sequencing-depth data frame and add metadata
+# ------------------------------------------------------------
+
+depth_df <- data.frame(
+  sample_ID = sample_names(ps),
+  Reads = as.numeric(sample_sums(ps)),
+  stringsAsFactors = FALSE
+)
+
+# Extract metadata as a normal data frame
+meta_df <- as.data.frame(sample_data(ps))
+meta_df$sample_ID <- rownames(meta_df)
+
+# Join sequencing depth with metadata
+depth_df <- depth_df %>%
+  left_join(meta_df, by = "sample_ID")
+
+# Standardize Sex as a factor
+depth_df <- depth_df %>%
+  mutate(
+    Sex = factor(
+      str_to_title(as.character(Sex)),
+      levels = c("F", "M")
+    )
+  )
+
+# Check that all samples received a sex assignment
+table(depth_df$Sex, useNA = "ifany")
+
+# Inspect final data
+head(depth_df)
+
+# Export sample read depth
+write_xlsx(depth_df, "sample_read_depth.xlsx")
+# ------------------------------------------------------------
+# Split sequencing-depth data by sex
+# ------------------------------------------------------------
+
+female_depth_df <- depth_df %>%
+  filter(Sex == "F")
+
+male_depth_df <- depth_df %>%
+  filter(Sex == "M")
+
+
+# ------------------------------------------------------------
+# Sex-specific sequencing-depth summaries
+# ------------------------------------------------------------
+
+female_depth_summary <- female_depth_df %>%
+  summarize(
+    Number_of_samples = n(),
+    Minimum_reads = min(Reads, na.rm = TRUE),
+    Percentile_5 = quantile(Reads, 0.05, na.rm = TRUE),
+    Percentile_10 = quantile(Reads, 0.10, na.rm = TRUE),
+    Percentile_25 = quantile(Reads, 0.25, na.rm = TRUE),
+    Median_reads = median(Reads, na.rm = TRUE),
+    Mean_reads = mean(Reads, na.rm = TRUE),
+    Maximum_reads = max(Reads, na.rm = TRUE)
+  )
+
+male_depth_summary <- male_depth_df %>%
+  summarize(
+    Number_of_samples = n(),
+    Minimum_reads = min(Reads, na.rm = TRUE),
+    Percentile_5 = quantile(Reads, 0.05, na.rm = TRUE),
+    Percentile_10 = quantile(Reads, 0.10, na.rm = TRUE),
+    Percentile_25 = quantile(Reads, 0.25, na.rm = TRUE),
+    Median_reads = median(Reads, na.rm = TRUE),
+    Mean_reads = mean(Reads, na.rm = TRUE),
+    Maximum_reads = max(Reads, na.rm = TRUE)
+  )
+
+female_depth_summary
+male_depth_summary
+
+# ------------------------------------------------------------
+# Use a common y-axis maximum for direct comparison
+# ------------------------------------------------------------
+
+depth_break_interval <- 20000
+
+depth_y_max <- ceiling(
+  max(depth_df$Reads, na.rm = TRUE) / depth_break_interval
+) * depth_break_interval
+
+
+# ------------------------------------------------------------
+# Female sequencing-depth plot
+# ------------------------------------------------------------
+
+female_reads_plot <- ggplot(
+  female_depth_df,
+  aes(x = Group, y = Reads, fill = Group)
+) +
+  geom_boxplot(
+    outlier.shape = NA,
+    alpha = 0.5
+  ) +
+  geom_jitter(
+    aes(color = Group),
+    width = 0.2,
+    size = 2,
+    alpha = 0.8
+  ) +
+  theme_bw() +
+  labs(
+    title = "Sequencing Depth per Sample - Female Large Intestine",
+    x = "Group",
+    y = "Read Counts"
+  ) +
+  scale_fill_brewer(palette = "Set2") +
+  scale_color_brewer(palette = "Set2") +
+  scale_y_continuous(
+    labels = comma,
+    breaks = seq(
+      0,
+      depth_y_max,
+      by = depth_break_interval
+    ),
+    limits = c(0, depth_y_max),
+    expand = expansion(mult = c(0, 0.05))
+  ) +
+  theme(
+    plot.title = element_text(
+      size = 16,
+      face = "bold",
+      hjust = 0.5
+    ),
+    axis.text = element_text(size = 12),
+    axis.title = element_text(size = 14)
+  )
+
+female_reads_plot
+
+ggsave(
+  "female_reads_plot.png",
+  plot = female_reads_plot,
+  width = 8,
+  height = 6,
+  dpi = 600
+)
+
+
+# ------------------------------------------------------------
+# Male sequencing-depth plot
+# ------------------------------------------------------------
+
+male_reads_plot <- ggplot(
+  male_depth_df,
+  aes(x = Group, y = Reads, fill = Group)
+) +
+  geom_boxplot(
+    outlier.shape = NA,
+    alpha = 0.5
+  ) +
+  geom_jitter(
+    aes(color = Group),
+    width = 0.2,
+    size = 2,
+    alpha = 0.8
+  ) +
+  theme_bw() +
+  labs(
+    title = "Sequencing Depth per Sample - Male Large Intestine",
+    x = "Group",
+    y = "Read Counts"
+  ) +
+  scale_fill_brewer(palette = "Set2") +
+  scale_color_brewer(palette = "Set2") +
+  scale_y_continuous(
+    labels = comma,
+    breaks = seq(
+      0,
+      depth_y_max,
+      by = depth_break_interval
+    ),
+    limits = c(0, depth_y_max),
+    expand = expansion(mult = c(0, 0.05))
+  ) +
+  theme(
+    plot.title = element_text(
+      size = 16,
+      face = "bold",
+      hjust = 0.5
+    ),
+    axis.text = element_text(size = 12),
+    axis.title = element_text(size = 14)
+  )
+
+male_reads_plot
+
+ggsave(
+  "male_reads_plot.png",
+  plot = male_reads_plot,
+  width = 8,
+  height = 6,
+  dpi = 600
+)
+
+
+# ============================================================
+# RAREFACTION CURVES BY SEX
+# ============================================================
+
+# Extract OTU table and convert to samples x taxa
+otu_df <- as.data.frame(t(as(otu_table(ps), "matrix")))
+
+# Make sample IDs an explicit column
+otu_df$Sample <- rownames(otu_df)
+
+head(otu_df)
+
+
+# ------------------------------------------------------------
+# Rarefaction function for an individual sample
+# ------------------------------------------------------------
+
+rarefaction_points <- function(x, step = 5000) {
+  
+  # Ensure counts are whole, nonnegative numbers
+  x <- round(as.numeric(x))
+  x[is.na(x)] <- 0
+  x[x < 0] <- 0
+  
+  total_reads <- sum(x)
+  
+  # Return no rows for samples with no reads
+  if (total_reads == 0) {
+    return(
+      data.frame(
+        Depth = numeric(0),
+        Observed = numeric(0)
+      )
+    )
+  }
+  
+  # Generate depths and make sure the total depth is included
+  seqs <- unique(
+    c(
+      seq(1, total_reads, by = step),
+      total_reads
+    )
+  )
+  
+  observed <- sapply(seqs, function(n) {
+    
+    sampled_taxa <- sample(
+      rep(seq_along(x), times = x),
+      size = n,
+      replace = FALSE
+    )
+    
+    length(unique(sampled_taxa))
+  })
+  
+  data.frame(
+    Depth = seqs,
+    Observed = observed
+  )
+}
+
+
+# Set seed so rarefaction results are reproducible
+set.seed(123)
+
+
+# ------------------------------------------------------------
+# Calculate rarefaction curves for all samples
+# ------------------------------------------------------------
+
+taxa_columns <- setdiff(colnames(otu_df), "Sample")
+
+rarefaction_df <- map_dfr(
+  seq_len(nrow(otu_df)),
+  function(i) {
+    
+    sample_counts <- as.numeric(
+      otu_df[i, taxa_columns, drop = TRUE]
+    )
+    
+    df <- rarefaction_points(
+      sample_counts,
+      step = 5000
+    )
+    
+    df$Sample <- otu_df$Sample[i]
+    
+    df
+  }
+)
+
+table(rarefaction_df$Sample)
+
+
+# ------------------------------------------------------------
+# Add metadata
+# ------------------------------------------------------------
+
+metadata <- as.data.frame(sample_data(ps))
+metadata$Sample <- rownames(metadata)
+
+rarefaction_df <- rarefaction_df %>%
+  left_join(metadata, by = "Sample") %>%
+  mutate(
+    Sex = factor(
+      str_to_title(as.character(Sex)),
+      levels = c("F", "M")
+    )
+  )
+
+# Check metadata assignments
+table(
+  rarefaction_df$Sex,
+  rarefaction_df$Treatment,
+  useNA = "ifany"
+)
+
+
+# ------------------------------------------------------------
+# Split rarefaction data by sex
+# ------------------------------------------------------------
+
+female_rarefaction_df <- rarefaction_df %>%
+  filter(Sex == "F")
+
+male_rarefaction_df <- rarefaction_df %>%
+  filter(Sex == "M")
+
+
+# ------------------------------------------------------------
+# Use the same x-axis maximum for male and female plots
+# ------------------------------------------------------------
+
+rarefaction_break_interval <- 25000
+
+rarefaction_x_max <- ceiling(
+  max(rarefaction_df$Depth, na.rm = TRUE) /
+    rarefaction_break_interval
+) * rarefaction_break_interval
+
+
+# ============================================================
+# INDIVIDUAL-SAMPLE RAREFACTION CURVES
+# ============================================================
+
+# ------------------------------------------------------------
+# Female individual-sample rarefaction plot
+# ------------------------------------------------------------
+
+female_rar_sample <- ggplot(
+  female_rarefaction_df,
+  aes(
+    x = Depth,
+    y = Observed,
+    color = Group,
+    group = Sample
+  )
+) +
+  geom_line(linewidth = 1) +
+  theme_bw() +
+  labs(
+    title = "Female Rarefaction Curves",
+    x = "Sequencing Depth",
+    y = "Observed Species",
+    color = "Group"
+  ) +
+  scale_color_brewer(
+    palette = "Set2",
+    breaks = c("Control", "Stress"),
+    labels = c("Control", "Stress")
+  ) +
+  scale_x_continuous(
+    labels = comma,
+    breaks = seq(
+      0,
+      rarefaction_x_max,
+      by = rarefaction_break_interval
+    ),
+    limits = c(0, rarefaction_x_max),
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  theme(
+    plot.title = element_text(
+      size = 16,
+      face = "bold",
+      hjust = 0.5
+    ),
+    axis.text = element_text(size = 12),
+    axis.title = element_text(size = 14)
+  )
+
+female_rar_sample
+
+ggsave(
+  "female_rarefaction_per_sample.png",
+  plot = female_rar_sample,
+  height = 8,
+  width = 10,
+  dpi = 600
+)
+
+
+# ------------------------------------------------------------
+# Male individual-sample rarefaction plot
+# ------------------------------------------------------------
+
+male_rar_sample <- ggplot(
+  male_rarefaction_df,
+  aes(
+    x = Depth,
+    y = Observed,
+    color = Group,
+    group = Sample
+  )
+) +
+  geom_line(linewidth = 1) +
+  theme_bw() +
+  labs(
+    title = "Male Rarefaction Curves",
+    x = "Sequencing Depth",
+    y = "Observed Species",
+    color = "Group"
+  ) +
+  scale_color_brewer(
+    palette = "Set2",
+    breaks = c("Control", "Stress"),
+    labels = c("Control", "Stress")
+  ) +
+  scale_x_continuous(
+    labels = comma,
+    breaks = seq(
+      0,
+      rarefaction_x_max,
+      by = rarefaction_break_interval
+    ),
+    limits = c(0, rarefaction_x_max),
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  theme(
+    plot.title = element_text(
+      size = 16,
+      face = "bold",
+      hjust = 0.5
+    ),
+    axis.text = element_text(size = 12),
+    axis.title = element_text(size = 14)
+  )
+
+male_rar_sample
+
+ggsave(
+  "male_rarefaction_per_sample.png",
+  plot = male_rar_sample,
+  height = 8,
+  width = 10,
+  dpi = 600
+)
+
+
+# ============================================================
+# TREATMENT-AVERAGED RAREFACTION CURVES BY SEX
+# ============================================================
+
+# Calculate treatment averages separately within each sex
+rarefaction_summary <- rarefaction_df %>%
+  group_by(Sex, Treatment, Depth) %>%
+  summarize(
+    MeanObserved = mean(Observed, na.rm = TRUE),
+    SDObserved = sd(Observed, na.rm = TRUE),
+    Number_of_samples = n_distinct(Sample),
+    .groups = "drop"
+  )
+
+
+# Split treatment summaries by sex
+female_rarefaction_summary <- rarefaction_summary %>%
+  filter(Sex == "F")
+
+male_rarefaction_summary <- rarefaction_summary %>%
+  filter(Sex == "M")
+
+# ------------------------------------------------------------
+# Female treatment-average rarefaction plot
+# ------------------------------------------------------------
+
+female_rar_avg <- ggplot() +
+  geom_line(
+    data = female_rarefaction_df,
+    aes(
+      x = Depth,
+      y = Observed,
+      group = Sample,
+      color = Treatment
+    ),
+    alpha = 0.3,
+    linewidth = 0.8
+  ) +
+  geom_line(
+    data = female_rarefaction_summary,
+    aes(
+      x = Depth,
+      y = MeanObserved,
+      color = Treatment
+    ),
+    linewidth = 1.5
+  ) +
+  theme_bw() +
+  labs(
+    title = "Female Rarefaction Curves by Treatment",
+    x = "Sequencing Depth",
+    y = "Observed Species"
+  ) +
+  scale_x_continuous(
+    labels = comma,
+    breaks = seq(
+      0,
+      rarefaction_x_max,
+      by = rarefaction_break_interval
+    ),
+    limits = c(0, rarefaction_x_max),
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  theme(
+    plot.title = element_text(
+      size = 16,
+      face = "bold",
+      hjust = 0.5
+    ),
+    axis.text = element_text(size = 12),
+    axis.title = element_text(size = 14)
+  )
+
+female_rar_avg
+
+ggsave(
+  "female_rarefaction_avg.png",
+  plot = female_rar_avg,
+  height = 8,
+  width = 10,
+  dpi = 600
+)
+
+
+# ------------------------------------------------------------
+# Male treatment-average rarefaction plot
+# ------------------------------------------------------------
+
+male_rar_avg <- ggplot() +
+  geom_line(
+    data = male_rarefaction_df,
+    aes(
+      x = Depth,
+      y = Observed,
+      group = Sample,
+      color = Treatment
+    ),
+    alpha = 0.3,
+    linewidth = 0.8
+  ) +
+  geom_line(
+    data = male_rarefaction_summary,
+    aes(
+      x = Depth,
+      y = MeanObserved,
+      color = Treatment
+    ),
+    linewidth = 1.5
+  ) +
+  theme_bw() +
+  labs(
+    title = "Male Rarefaction Curves by Treatment",
+    x = "Sequencing Depth",
+    y = "Observed Species"
+  ) +
+  scale_x_continuous(
+    labels = comma,
+    breaks = seq(
+      0,
+      rarefaction_x_max,
+      by = rarefaction_break_interval
+    ),
+    limits = c(0, rarefaction_x_max),
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  theme(
+    plot.title = element_text(
+      size = 16,
+      face = "bold",
+      hjust = 0.5
+    ),
+    axis.text = element_text(size = 12),
+    axis.title = element_text(size = 14)
+  )
+
+male_rar_avg
+
+ggsave(
+  "male_rarefaction_avg.png",
+  plot = male_rar_avg,
+  height = 8,
+  width = 10,
+  dpi = 600
+)
+```
+
+################# Relative abundance workflow #################
+Create the relative abundance phyloseq object
+```{r}
+ps_rel <- transform_sample_counts(ps, function(x) x / sum(x))
+```
+
+--------------------- Stacked barplots for taxonomy (Fig. 2B & C) ---------------------
+Stacked bar plot function
+```{r}
+plot_taxa_barplot <- function(ps_obj,
+                              tax_level = "Genus",
+                              sex_label = "F",
+                              output_file = NULL,
+                              excel_file = NULL,
+                              top_n = 20,
+                              relative = TRUE,
+                              palette = "Paired") {
+  
+  # Collapse to chosen taxonomic level
+  ps_tax <- tax_glom(
+    ps_obj,
+    taxrank = tax_level
+  )
+  
+  # Convert to long format
+  df <- psmelt(ps_tax)
+  
+  # Ensure Group order
+  df$Group <- factor(
+    df$Group,
+    levels = c("Control", "Stress")
+  )
+  
+  # Filter by sex
+  df_sex <- df %>%
+    filter(Sex == sex_label)
+  
+  # Convert to relative abundance if desired
+  if (relative) {
+    df_sex <- df_sex %>%
+      group_by(Sample) %>%
+      mutate(
+        Abundance = Abundance / sum(Abundance)
+      ) %>%
+      ungroup()
+  }
+  
+  # Aggregate abundances
+  df_agg <- df_sex %>%
+    group_by(
+      Sample,
+      Group,
+      !!sym(tax_level)
+    ) %>%
+    summarise(
+      Abundance = sum(Abundance),
+      .groups = "drop"
+    )
+  
+    # Aggregate abundances
+  df_agg <- df_sex %>%
+    group_by(
+      Sample,
+      Group,
+      !!sym(tax_level)
+    ) %>%
+    summarise(
+      Abundance = sum(Abundance),
+      .groups = "drop"
+    )
+
+  # Export abundance data to Excel
+  if (!is.null(excel_file)) {
+
+    # Long-format data
+    abundance_long <- df_agg %>%
+      rename(
+        Taxon = !!sym(tax_level)
+      ) %>%
+      arrange(Group, Sample, desc(Abundance))
+
+    # Wide-format data: one row per taxon, one column per sample
+    abundance_wide <- abundance_long %>%
+      select(Taxon, Sample, Abundance) %>%
+      tidyr::pivot_wider(
+        names_from = Sample,
+        values_from = Abundance,
+        values_fill = 0
+      )
+
+    writexl::write_xlsx(
+      list(
+        Relative_abundance_long = abundance_long,
+        Relative_abundance_wide = abundance_wide
+      ),
+      path = excel_file
+    )
+  }
+  
+  # Identify top taxa
+  top_taxa <- df_agg %>%
+    group_by(!!sym(tax_level)) %>%
+    summarise(
+      TotalAbundance = sum(Abundance),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(TotalAbundance)) %>%
+    slice_head(n = top_n) %>%
+    pull(!!sym(tax_level))
+  
+  # Collapse lower-abundance taxa into "Other"
+  df_top <- df_agg %>%
+    mutate(
+      Taxon = ifelse(
+        !!sym(tax_level) %in% top_taxa,
+        as.character(!!sym(tax_level)),
+        "Other"
+      )
+    ) %>%
+    group_by(Sample, Group, Taxon) %>%
+    summarise(
+      Abundance = sum(Abundance),
+      .groups = "drop"
+    )
+  
+  # Put Other last
+  tax_levels <- c(
+    sort(setdiff(unique(df_top$Taxon), "Other")),
+    "Other"
+  )
+  
+  df_top$Taxon <- factor(
+    df_top$Taxon,
+    levels = tax_levels
+  )
+  
+  # Generate taxon colors
+  n_tax <- length(tax_levels) - 1
+  
+  tax_colors <- brewer.pal(
+    min(n_tax, 12),
+    palette
+  )
+  
+  if (n_tax > 12) {
+    tax_colors <- colorRampPalette(
+      brewer.pal(12, palette)
+    )(n_tax)
+  }
+  
+  # Add gray for the Other category
+  tax_colors <- c(
+    tax_colors,
+    "gray60"
+  )
+  
+  names(tax_colors) <- tax_levels
+  
+  # Define group colors
+  group_colors <- c(
+    "Control" = "#4D4D4D",
+    "Stress"  = "#FE8A13"
+  )
+  
+  # Plot
+  p <- ggplot(
+    df_top,
+    aes(
+      x = Sample,
+      y = Abundance,
+      fill = Taxon
+    )
+  ) +
+    
+    geom_bar(
+      stat = "identity",
+      color = "black",
+      linewidth = 0.2
+    ) +
+    
+    # Invisible layer used to generate the Group legend
+    geom_point(
+      data = df_top %>%
+        distinct(Sample, Group),
+      aes(
+        x = Sample,
+        y = 0,
+        color = Group
+      ),
+      inherit.aes = FALSE,
+      alpha = 0,
+      show.legend = TRUE
+    ) +
+    
+    # Group-specific facet ribbons
+    ggh4x::facet_wrap2(
+      ~ Group,
+      nrow = 1,
+      scales = "free_x",
+      strip = ggh4x::strip_themed(
+        
+        background_x = ggh4x::elem_list_rect(
+          fill = c(
+            "#4D4D4D",
+            "#FE8A13"
+          ),
+          color = "black",
+          linewidth = 0.5
+        ),
+        
+        # Keep the colored ribbons but hide their labels
+        text_x = ggh4x::elem_list_text(
+          color = "transparent",
+          size = 20
+        )
+      )
+    ) +
+    
+    scale_fill_manual(
+      values = tax_colors,
+      name = tax_level
+    ) +
+    
+    scale_color_manual(
+      values = group_colors,
+      name = "Group"
+    ) +
+    
+    ylab(
+      ifelse(
+        relative,
+        "Relative Abundance",
+        "Estimated Abundance"
+      )
+    ) +
+    
+    xlab("Sample") +
+    
+    ggtitle(
+      paste0(
+        tax_level,
+        "-level Abundance - LI ",
+        ifelse(
+          sex_label == "F",
+          "F",
+          "M"
+        )
+      )
+    ) +
+    
+    theme_bw(base_size = 18) +
+    
+    theme(
+      # X-axis formatting
+      axis.text.x = element_blank(),
+      axis.ticks.x = element_blank(),
+      axis.title.x = element_text(
+        size = 20,
+        face = "bold",
+        margin = margin(t = 10)
+      ),
+      
+      # Y-axis formatting
+      axis.text.y = element_text(
+        size = 17,
+        color = "black"
+      ),
+      axis.title.y = element_text(
+        size = 20,
+        face = "bold",
+        margin = margin(r = 10)
+      ),
+      
+      # Plot title
+      plot.title = element_text(
+        hjust = 0.5,
+        face = "bold",
+        size = 22,
+        margin = margin(b = 12)
+      ),
+      
+      # Legend formatting
+      legend.position = "right",
+      legend.direction = "vertical",
+      legend.box = "vertical",
+      legend.title = element_text(
+        size = 19,
+        face = "bold"
+      ),
+      legend.text = element_text(size = 16),
+      legend.key.size = grid::unit(0.7, "cm")
+    ) +
+    
+    guides(
+        # Group legend with thin black borders
+        color = guide_legend(
+          order = 1,
+          override.aes = list(
+            alpha = 1,
+            shape = 22,
+            size = 7,
+            fill = unname(group_colors),
+            color = "black",
+            stroke = 0.6
+          )
+        ),
+        
+        # Taxon legend with thin black borders
+        fill = guide_legend(
+          order = 2,
+          ncol = 1,
+          override.aes = list(
+            color = "black",
+            linewidth = 0.4
+          )
+        )
+      )
+  
+  # Save if filename is provided
+  if (!is.null(output_file)) {
+    ggsave(
+      filename = output_file,
+      plot = p,
+      width = 10,
+      height = 12,
+      dpi = 600
+    )
+  }
+  
+  return(p)
+}
+```
+
+Export relative abundance files
+```{r}
+write_xlsx(df_agg, "relative_abundance_genus.tsv")
+```
+
+Plot stacked bars
+```{r}
+# Plot females
+stacked_bar_female <- plot_taxa_barplot(
+  ps_obj = ps_rel,
+  tax_level = "Genus",
+  top_n = 20,
+  sex_label = "F",
+  output_file = "genus_female.png",
+  excel_file = "genus_female_relative_abundance.xlsx"
+)
+
+# Plot males
+stacked_bar_male <- plot_taxa_barplot(
+  ps_obj = ps_rel,
+  tax_level = "Genus",
+  top_n = 20,
+  sex_label = "M",
+  output_file = "genus_male.png",
+  excel_file = "genus_male_relative_abundance.xlsx"
+)
+
+# Optionally, display plots in R
+print(stacked_bar_female)
+print(stacked_bar_male)
+```
+
+--------------------- Beta diversity (Fig. 2D & E) ---------------------
+Beta diversity female
+```{r}
+# Subset female samples
+ps_f <- subset_samples(
+  ps_rel,
+  Sex == "F"
+)
+
+# Remove taxa that have zero abundance across all female samples
+ps_f <- prune_taxa(
+  taxa_sums(ps_f) > 0,
+  ps_f
+)
+
+# Extract female metadata
+meta_f <- as(
+  sample_data(ps_f),
+  "data.frame"
+)
+
+meta_f$sample_ID <- rownames(meta_f)
+
+# Set group order
+meta_f$Group <- factor(
+  meta_f$Group,
+  levels = c("Control", "Stress")
+)
+
+# Calculate Bray-Curtis distances
+bray_dist_f <- phyloseq::distance(
+  ps_f,
+  method = "bray"
+)
+
+# Ensure metadata rows follow the same sample order as the distance object
+meta_f <- meta_f[
+  labels(bray_dist_f),
+  ,
+  drop = FALSE
+]
+
+# Confirm that sample ordering matches
+stopifnot(
+  identical(
+    rownames(meta_f),
+    labels(bray_dist_f)
+  )
+)
+
+# -------------------------
+# PCoA
+# -------------------------
+
+ord_bray_f <- ape::pcoa(
+  bray_dist_f
+)
+
+# Extract the first two PCoA axes
+ord_df_f <- as.data.frame(
+  ord_bray_f$vectors[, 1:2]
+)
+
+colnames(ord_df_f) <- c(
+  "Axis.1",
+  "Axis.2"
+)
+
+ord_df_f$sample_ID <- rownames(
+  ord_df_f
+)
+
+# Add sample metadata to the PCoA plotting data
+ord_df_f <- merge(
+  ord_df_f,
+  meta_f,
+  by = "sample_ID",
+  sort = FALSE
+)
+
+# Restore the original PCoA sample order after merging
+ord_df_f <- ord_df_f[
+  match(
+    rownames(ord_bray_f$vectors),
+    ord_df_f$sample_ID
+  ),
+]
+
+rownames(ord_df_f) <- NULL
+
+# -------------------------
+# PERMANOVA
+# -------------------------
+
+set.seed(123)
+
+adonis_female <- vegan::adonis2(
+  bray_dist_f ~ Group,
+  data = meta_f,
+  permutations = 9999
+)
+
+# Extract PERMANOVA p-value for plotting
+pval_female <- adonis_female$`Pr(>F)`[1]
+
+# View complete PERMANOVA results
+adonis_female
+
+# -------------------------
+# Beta dispersion
+# -------------------------
+
+# Calculate distances to group centroids
+bd_f <- vegan::betadisper(
+  bray_dist_f,
+  meta_f$Group
+)
+
+# Save the standard beta-dispersion ANOVA as an object
+bd_anova_f <- anova(
+  bd_f
+)
+
+# Save the permutation-based beta-dispersion test as an object
+set.seed(123)
+
+bd_permutest_f <- vegan::permutest(
+  bd_f,
+  permutations = 9999
+)
+```
+
+Beta diversity males
+```{r}
+# Subset male samples
+ps_m <- subset_samples(
+  ps_rel,
+  Sex == "M"
+)
+
+# Remove taxa that have zero abundance across all male samples
+ps_m <- prune_taxa(
+  taxa_sums(ps_m) > 0,
+  ps_m
+)
+
+# Extract male metadata
+meta_m <- as(
+  sample_data(ps_m),
+  "data.frame"
+)
+
+meta_m$sample_ID <- rownames(meta_m)
+
+# Set group order
+meta_m$Group <- factor(
+  meta_m$Group,
+  levels = c("Control", "Stress")
+)
+
+# Calculate Bray-Curtis distances
+bray_dist_m <- phyloseq::distance(
+  ps_m,
+  method = "bray"
+)
+
+# Ensure metadata rows follow the same sample order as the distance object
+meta_m <- meta_m[
+  labels(bray_dist_m),
+  ,
+  drop = FALSE
+]
+
+# Confirm that sample ordering matches
+stopifnot(
+  identical(
+    rownames(meta_m),
+    labels(bray_dist_m)
+  )
+)
+
+# -------------------------
+# PCoA
+# -------------------------
+
+ord_bray_m <- ape::pcoa(
+  bray_dist_m
+)
+
+# Extract the first two PCoA axes
+ord_df_m <- as.data.frame(
+  ord_bray_m$vectors[, 1:2]
+)
+
+colnames(ord_df_m) <- c(
+  "Axis.1",
+  "Axis.2"
+)
+
+ord_df_m$sample_ID <- rownames(
+  ord_df_m
+)
+
+# Add sample metadata to the PCoA plotting data
+ord_df_m <- merge(
+  ord_df_m,
+  meta_m,
+  by = "sample_ID",
+  sort = FALSE
+)
+
+# Restore the original PCoA sample order after merging
+ord_df_m <- ord_df_m[
+  match(
+    rownames(ord_bray_m$vectors),
+    ord_df_m$sample_ID
+  ),
+]
+
+rownames(ord_df_m) <- NULL
+
+# -------------------------
+# PERMANOVA
+# -------------------------
+
+set.seed(123)
+
+adonis_male <- vegan::adonis2(
+  bray_dist_m ~ Group,
+  data = meta_m,
+  permutations = 9999
+)
+
+# Extract PERMANOVA p-value for plotting
+pval_male <- adonis_male$`Pr(>F)`[1]
+
+# View complete PERMANOVA results
+adonis_male
+
+# -------------------------
+# Beta dispersion
+# -------------------------
+
+# Calculate distances to group centroids
+bd_m <- vegan::betadisper(
+  bray_dist_m,
+  meta_m$Group
+)
+
+# Save the standard beta-dispersion ANOVA as an object
+bd_anova_m <- anova(
+  bd_m
+)
+
+# Save the permutation-based beta-dispersion test as an object
+set.seed(123)
+
+bd_permutest_m <- vegan::permutest(
+  bd_m,
+  permutations = 9999
+)
+```
+
+Stats and plotting data export function
+```{r}
+prepare_beta_export <- function(
+    ord_df,
+    ord_obj,
+    distance_obj,
+    adonis_result,
+    betadisper_obj,
+    betadisper_anova,
+    betadisper_permutest,
+    sex_label
+) {
+  
+  sex_name <- ifelse(sex_label == "F", "Female", "Male")
+  
+  # -------------------------------------------------------
+  # 1. Exact data used in the PCoA plot
+  # -------------------------------------------------------
+  
+  plotting_data <- ord_df %>%
+    mutate(
+      Sex_analysis = sex_name,
+      Group = as.character(Group)
+    ) %>%
+    relocate(
+      sample_ID,
+      Sex_analysis,
+      Group,
+      Axis.1,
+      Axis.2
+    ) %>%
+    arrange(Group, sample_ID)
+  
+  # -------------------------------------------------------
+  # 2. PERMANOVA results
+  # -------------------------------------------------------
+  
+  permanova_results <- as.data.frame(adonis_result) %>%
+    rownames_to_column("Term") %>%
+    mutate(
+      Sex_analysis = sex_name,
+      Distance = "Bray-Curtis",
+      Permutations = 9999,
+      .before = 1
+    )
+  
+  # -------------------------------------------------------
+  # 3. Beta-dispersion ANOVA results
+  # -------------------------------------------------------
+  
+  dispersion_anova_results <- as.data.frame(
+    betadisper_anova
+  ) %>%
+    rownames_to_column("Term") %>%
+    mutate(
+      Sex_analysis = sex_name,
+      Distance = "Bray-Curtis",
+      .before = 1
+    )
+  
+  # -------------------------------------------------------
+  # 4. Permutation test of beta dispersion
+  # -------------------------------------------------------
+  
+  dispersion_perm_results <- as.data.frame(
+    betadisper_permutest$tab
+  ) %>%
+    rownames_to_column("Term") %>%
+    mutate(
+      Sex_analysis = sex_name,
+      Distance = "Bray-Curtis",
+      .before = 1
+    )
+  
+  # -------------------------------------------------------
+  # 5. Distance to group centroid for each sample
+  # -------------------------------------------------------
+  
+  dispersion_sample_data <- data.frame(
+    sample_ID = names(betadisper_obj$distances),
+    Group = as.character(betadisper_obj$group),
+    Distance_to_centroid = unname(
+      betadisper_obj$distances
+    ),
+    Sex_analysis = sex_name
+  ) %>%
+    relocate(
+      sample_ID,
+      Sex_analysis,
+      Group,
+      Distance_to_centroid
+    ) %>%
+    arrange(Group, sample_ID)
+  
+  # -------------------------------------------------------
+  # 6. PCoA eigenvalues and variance explained
+  # -------------------------------------------------------
+  
+  variance_explained <- as.data.frame(
+    ord_obj$values
+  ) %>%
+    mutate(
+      Axis = paste0("PCoA_", row_number()),
+      Sex_analysis = sex_name,
+      .before = 1
+    )
+  
+  # Convert proportions to percentages for readability
+  if ("Relative_eig" %in% names(variance_explained)) {
+    variance_explained <- variance_explained %>%
+      mutate(
+        Percent_explained = Relative_eig * 100
+      )
+  }
+  
+  # -------------------------------------------------------
+  # 7. Bray-Curtis distance matrix
+  # -------------------------------------------------------
+  
+  distance_matrix <- as.matrix(distance_obj) %>%
+    as.data.frame(check.names = FALSE) %>%
+    rownames_to_column("sample_ID")
+  
+  # -------------------------------------------------------
+  # 8. Bray-Curtis distances in long format
+  # -------------------------------------------------------
+  
+  distance_long <- as.matrix(distance_obj) %>%
+    as.data.frame(check.names = FALSE) %>%
+    rownames_to_column("Sample_1") %>%
+    pivot_longer(
+      cols = -Sample_1,
+      names_to = "Sample_2",
+      values_to = "Bray_Curtis_distance"
+    ) %>%
+    # Remove self-comparisons and duplicate pairs
+    filter(Sample_1 < Sample_2) %>%
+    mutate(
+      Sex_analysis = sex_name,
+      .before = 1
+    ) %>%
+    arrange(Sample_1, Sample_2)
+  
+  return(
+    list(
+      PCoA_Plotting_Data = plotting_data,
+      PERMANOVA_Results = permanova_results,
+      Dispersion_ANOVA = dispersion_anova_results,
+      Dispersion_Permutation = dispersion_perm_results,
+      Distances_to_Centroid = dispersion_sample_data,
+      Variance_Explained = variance_explained,
+      Bray_Curtis_Long = distance_long,
+      Bray_Curtis_Matrix = distance_matrix
+    )
+  )
+}
+```
+
+Run function to create file outputs
+```{r}
+female_beta_export <- prepare_beta_export(
+  ord_df = ord_df_f,
+  ord_obj = ord_bray_f,
+  distance_obj = bray_dist_f,
+  adonis_result = adonis_female,
+  betadisper_obj = bd_f,
+  betadisper_anova = bd_anova_f,
+  betadisper_permutest = bd_permutest_f,
+  sex_label = "F"
+)
+
+male_beta_export <- prepare_beta_export(
+  ord_df = ord_df_m,
+  ord_obj = ord_bray_m,
+  distance_obj = bray_dist_m,
+  adonis_result = adonis_male,
+  betadisper_obj = bd_m,
+  betadisper_anova = bd_anova_m,
+  betadisper_permutest = bd_permutest_m,
+  sex_label = "M"
+)
+
+write_xlsx(
+  female_beta_export,
+  path = "beta_diversity_female_data_and_statistics.xlsx"
+)
+
+write_xlsx(
+  male_beta_export,
+  path = "beta_diversity_male_data_and_statistics.xlsx"
+)
+```
+
+Beta diversity plots 
+```{r}
+# --- Metadata ---
+meta <- as(sample_data(ps_rel), "data.frame")
+meta$sample_ID <- rownames(meta)
+
+# --- Bray–Curtis distance ---
+bray_dist <- phyloseq::distance(ps_rel, method = "bray")
+
+# --- PCoA ---
+ord_bray <- ape::pcoa(bray_dist)
+
+# --- Make plotting data frame ---
+ord_df <- as.data.frame(ord_bray$vectors[, 1:2])
+colnames(ord_df) <- c("Axis.1", "Axis.2")
+ord_df$sample_ID <- rownames(ord_df)
+ord_df <- merge(ord_df, meta, by = "sample_ID")
+
+# --- PERMANOVA ---
+meta_f <- meta %>% filter(Sex == "F")
+keep_f <- intersect(rownames(meta_f), rownames(as.matrix(bray_dist)))
+bray_dist_f <- as.dist(as.matrix(bray_dist)[keep_f, keep_f])
+meta_f <- meta_f[keep_f, ]
+meta_f$Group <- factor(meta_f$Group, levels = c("Control", "Stress"))
+adonis_female <- adonis2(bray_dist_f ~ Group, data = meta_f, permutations = 9999)
+pval_female <- adonis_female$`Pr(>F)`[1]
+
+meta_m <- meta %>% filter(Sex == "M")
+keep_m <- intersect(rownames(meta_m), rownames(as.matrix(bray_dist)))
+bray_dist_m <- as.dist(as.matrix(bray_dist)[keep_m, keep_m])
+meta_m <- meta_m[keep_m, ]
+meta_m$Group <- factor(meta_m$Group, levels = c("Control", "Stress"))
+adonis_male <- adonis2(bray_dist_m ~ Group, data = meta_m, permutations = 9999)
+pval_male <- adonis_male$`Pr(>F)`[1]
+
+# --- Plot function ---
+plot_beta_by_sex <- function(df, sex_label, pval) {
+  
+  df_sex <- df %>% filter(Sex == sex_label)
+  eig1 <- round(ord_bray$values$Relative_eig[1] * 100, 1)
+  eig2 <- round(ord_bray$values$Relative_eig[2] * 100, 1)
+  
+  # Colors
+  fill_colors <- c("Control" = "#4D4D4D", "Stress" = "#FE8A13")
+  line_colors <- c("Control" = "#4D4D4D", "Stress" = "#FE8A13")
+  
+  # Significance label
+  sig_label <- ifelse(pval < 0.001, "***",
+                      ifelse(pval < 0.01, "**",
+                             ifelse(pval < 0.05, "*", "ns")))
+  
+  # Text color logic
+  text_color <- ifelse(pval < 0.05, "black", "gray50")
+  
+  # Plot
+  ggplot(df_sex, aes(x = Axis.1, y = Axis.2)) +
+    geom_point(aes(fill = Group), shape = 21, size = 5, color = "gray50", alpha = 1.0) +
+    stat_ellipse(aes(group = Group, fill = Group),
+                 geom = "polygon", alpha = 0.25, color = NA,
+                 level = 0.8, type = "norm") +
+    #stat_ellipse(aes(group = Group, color = Group),
+    #geom = "path", linetype = "solid", size = 0.5,
+    #level = 0.9, type = "norm") +
+    scale_fill_manual(values = fill_colors) +
+    #scale_color_manual(values = line_colors) +
+    annotate("text",
+             x = Inf, y = Inf,
+             label = paste0("PERMANOVA, ", sig_label, "  p=", signif(pval, 3)),
+             hjust = 1.1, vjust = 1.5,
+             size = 5, fontface = "bold", color = text_color) +
+    theme_bw() +
+    labs(
+      title = paste("Beta Diversity (PCoA - Bray–Curtis) - Large Intestine", 
+                    ifelse(sex_label == "F", "Females", "Males")),
+      x = paste0("PCoA 1 (", eig1, "%)"),
+      y = paste0("PCoA 2 (", eig2, "%)")
+    ) +
+    theme(
+      plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+      axis.text = element_text(size = 12),
+      axis.title = element_text(size = 14, face = "bold"),
+      legend.title = element_text(size = 12, face = "bold"),
+      legend.text = element_text(size = 11)
+    )
+}
+
+
+# --- Generate plots ---
+p_beta_female <- plot_beta_by_sex(ord_df, "F", pval_female)
+p_beta_male   <- plot_beta_by_sex(ord_df, "M", pval_male)
+
+# --- Display ---
+p_beta_female
+p_beta_male
+
+ggsave("beta_female.png", plot = p_beta_female, width = 9, height = 6, dpi = 600)
+ggsave("beta_males.png", plot = p_beta_male, width = 8, height = 6, dpi = 600)
+```
+
+--------------------- Alpha diversity (Fig. S2C & D) ---------------------
+Compute alpha diversity metrics
+```{r}
+otu_alpha <- as(otu_table(ps_rel), "matrix")
+
+if(taxa_are_rows(ps_rel)) {
+  otu_alpha <- t(otu_alpha)
+}
+
+shannon <- vegan::diversity(otu_alpha, index = "shannon")
+simpson <- vegan::diversity(otu_alpha, index = "simpson")
+
+```
+
+Build alpha diversity data frame
+```{r}
+alpha_div <- data.frame(
+  sample_ID = names(shannon),
+  Shannon = shannon,
+  Simpson = simpson
+)
+```
+
+Add metadata
+```{r}
+meta <- data.frame(sample_data(ps_rel))
+
+meta$sample_ID <- rownames(meta)
+
+alpha_div <- alpha_div %>%
+  left_join(meta, by = "sample_ID")
+
+# Keep only samples with valid metadata
+alpha_div <- alpha_div %>%
+  filter(!is.na(Group),
+         !is.na(Sex))
+```
+
+Factor ordering
+```{r}
+alpha_div$Group <- factor(
+  alpha_div$Group,
+  levels = c("Control", "Stress")
+)
+
+alpha_div$Sex <- factor(
+  alpha_div$Sex,
+  levels = c("F", "M")
+)
+```
+
+Format for plotting
+```{r}
+alpha_long <- alpha_div %>%
+  pivot_longer(
+    cols = c("Shannon", "Simpson"),
+    names_to = "Metric",
+    values_to = "Value"
+  ) %>%
+  mutate(
+    Metric = factor(
+      Metric,
+      levels = c("Shannon", "Simpson")
+    )
+  )
+```
+
+Function to prepare plotting data and statistical results, by sex
+```{r}
+prepare_alpha_export <- function(alpha_long, sex_label) {
+  
+  # Exact data used for plotting
+  plotting_data <- alpha_long %>%
+    filter(Sex == sex_label) %>%
+    mutate(
+      Sex = as.character(Sex),
+      Group = factor(Group, levels = c("Control", "Stress")),
+      Metric = factor(Metric, levels = c("Shannon", "Simpson"))
+    ) %>%
+    arrange(Metric, Group, sample_ID) %>%
+    mutate(
+      Group = as.character(Group),
+      Metric = as.character(Metric)
+    )
+  
+  # Wilcoxon test
+  statistical_results <- lapply(
+    c("Shannon", "Simpson"),
+    function(metric_name) {
+      
+      df_metric <- plotting_data %>%
+        filter(Metric == metric_name)
+      
+      control_values <- df_metric %>%
+        filter(Group == "Control") %>%
+        pull(Value)
+      
+      stress_values <- df_metric %>%
+        filter(Group == "Stress") %>%
+        pull(Value)
+      
+      # Return a row only when both groups have sufficient observations
+      if (length(control_values) > 1 &&
+          length(stress_values) > 1) {
+        
+        test_result <- wilcox.test(
+          control_values,
+          stress_values,
+          exact = FALSE
+        )
+        
+        p_value <- test_result$p.value
+        
+        significance <- case_when(
+          p_value < 0.001 ~ "***",
+          p_value < 0.01  ~ "**",
+          p_value < 0.05  ~ "*",
+          TRUE            ~ "ns"
+        )
+        
+        data.frame(
+          Sex = ifelse(sex_label == "F", "Female", "Male"),
+          Metric = metric_name,
+          Comparison = "Control vs Stress",
+          Test = test_result$method,
+          W_statistic = unname(test_result$statistic),
+          p_value = p_value,
+          Significance = significance,
+          Control_n = length(control_values),
+          Stress_n = length(stress_values),
+          Control_mean = mean(control_values, na.rm = TRUE),
+          Stress_mean = mean(stress_values, na.rm = TRUE),
+          Control_SD = sd(control_values, na.rm = TRUE),
+          Stress_SD = sd(stress_values, na.rm = TRUE),
+          Control_median = median(control_values, na.rm = TRUE),
+          Stress_median = median(stress_values, na.rm = TRUE),
+          Control_IQR = IQR(control_values, na.rm = TRUE),
+          Stress_IQR = IQR(stress_values, na.rm = TRUE)
+        )
+        
+      } else {
+        NULL
+      }
+    }
+  ) %>%
+    bind_rows()
+  
+  return(
+    list(
+      Plotting_Data = plotting_data,
+      Wilcoxon_Results = statistical_results
+    )
+  )
+}
+```
+
+Prepare and export results
+```{r}
+# Prepare female and male results
+female_alpha_export <- prepare_alpha_export(
+  alpha_long = alpha_long,
+  sex_label = "F"
+)
+
+male_alpha_export <- prepare_alpha_export(
+  alpha_long = alpha_long,
+  sex_label = "M"
+)
+
+# Export each sex as a separate Excel workbook
+write_xlsx(
+  female_alpha_export,
+  path = "alpha_diversity_female_data_and_statistics.xlsx"
+)
+
+write_xlsx(
+  male_alpha_export,
+  path = "alpha_diversity_male_data_and_statistics.xlsx"
+)
+```
+
+Plotting function
+```{r}
+plot_alpha_box_signif <- function(alpha_long, sex_label) {
+  
+# Filter by sex
+  df <- alpha_long %>%
+    filter(Sex == sex_label)
+  
+ # Ensure factors
+  df$Group  <- factor(df$Group,
+                      levels = c("Control", "Stress"))
+  
+  df$Metric <- factor(df$Metric,
+                      levels = c("Shannon", "Simpson"))
+  
+  df <- df %>%
+    mutate(Group_num = as.numeric(Group))
+  
+# Stats
+  sig_list <- lapply(levels(df$Metric), function(metric) {
+    
+    df_metric <- df %>%
+      filter(Metric == metric)
+    
+    val1 <- df_metric$Value[df_metric$Group == "Control"]
+    val2 <- df_metric$Value[df_metric$Group == "Stress"]
+    
+    if(length(val1) > 1 & length(val2) > 1) {
+      
+      test <- wilcox.test(
+        val1,
+        val2,
+        exact = FALSE
+      )
+      
+      p <- test$p.value
+      
+      sig <- ifelse(
+        p < 0.001, "***",
+        ifelse(
+          p < 0.01, "**",
+          ifelse(
+            p < 0.05, "*", "ns"
+          )
+        )
+      )
+      
+      p_label <- ifelse(
+        p < 0.001,
+        paste0("Wilcoxon, ", sig, "  p<0.001"),
+        paste0("Wilcoxon, ", sig, "  p=", signif(p, 2))
+      )
+      
+      return(
+        data.frame(
+          Metric = metric,
+          x_start = 1,
+          x_end = 2,
+          label = p_label,
+          sig = sig,
+          p_value = p
+        )
+      )
+    }
+    
+    return(NULL)
+  })
+  
+  sig_df <- bind_rows(sig_list)
+  
+# Base plot
+  
+  p <- ggplot(
+    df,
+    aes(x = Group_num,
+        y = Value,
+        fill = Group)
+  ) +
+    
+    geom_violin(
+      trim = FALSE,
+      alpha = 0.7
+    ) +
+    
+    geom_boxplot(
+      width = 0.1,
+      outlier.shape = NA,
+      alpha = 0.5,
+      color = "black"
+    ) +
+    
+    geom_jitter(
+      width = 0.15,
+      alpha = 0.7,
+      size = 2,
+      color = "black"
+    ) +
+    
+    facet_wrap(
+      ~ Metric,
+      scales = "free_y"
+    ) +
+    
+    scale_x_continuous(
+      breaks = 1:2,
+      labels = levels(df$Group)
+    ) +
+    
+    scale_fill_manual(
+      values = c(
+        "Control" = "#4D4D4D",
+        "Stress"  = "#FE8A13"
+      )
+    ) +
+    
+    theme_bw() +
+    
+    theme(
+      plot.title = element_text(
+        size = 16,
+        face = "bold",
+        hjust = 0.5
+      ),
+      
+      axis.text.x = element_text(
+        size = 12,
+        face = "bold"
+      ),
+      
+      axis.text.y = element_text(size = 10),
+      
+      strip.text = element_text(
+        size = 14,
+        face = "bold"
+      ),
+      
+      axis.title.y = element_text(
+        size = 14,
+        face = "bold"
+      ),
+      
+      legend.position = "none"
+    ) +
+    
+    labs(
+      x = NULL,
+      y = "Alpha Diversity",
+      title = paste(
+        "Alpha Diversity - Large Intestine",
+        ifelse(
+          sex_label == "F",
+          "Females",
+          "Males"
+        )
+      )
+    )
+  
+# Add significance bars
+
+  if(!is.null(sig_df) && nrow(sig_df) > 0) {
+    
+    gb <- ggplot_build(p)
+    
+    y_ranges <- gb$layout$panel_params %>%
+      lapply(function(x)
+        c(x$y.range[1], x$y.range[2]))
+    
+    sig_df <- sig_df %>%
+      group_by(Metric) %>%
+      mutate(
+        y = y_ranges[[which(
+          levels(df$Metric) == Metric
+        )]][2] * 1.05
+      ) %>%
+      ungroup()
+    
+    p <- p +
+      
+      geom_segment(
+        data = sig_df,
+        aes(
+          x = x_start,
+          xend = x_end,
+          y = y,
+          yend = y
+        ),
+        inherit.aes = FALSE,
+        linewidth = 0.8
+      ) +
+      
+      geom_text(
+        data = sig_df,
+        aes(
+          x = (x_start + x_end)/2,
+          y = y,
+          label = label,
+          color = sig
+        ),
+        inherit.aes = FALSE,
+        vjust = -0.6,
+        size = 4.5,
+        show.legend = FALSE
+      ) +
+      
+      scale_color_manual(
+        values = c(
+          "ns" = "gray50",
+          "*" = "black",
+          "**" = "black",
+          "***" = "black"
+        )
+      )
+  }
+  
+  return(p)
+}
+```
+
+Generate plots
+```{r}
+alpha_sig_females <- plot_alpha_box_signif(
+  alpha_long,
+  "F"
+)
+
+alpha_sig_males <- plot_alpha_box_signif(
+  alpha_long,
+  "M"
+)
+
+# View plots
+alpha_sig_females
+alpha_sig_males
+```
+
+Save plots
+```{r}
+ggsave(
+  "alpha_sig_females.png",
+  plot = alpha_sig_females,
+  width = 10,
+  height = 6,
+  dpi = 600
+)
+
+ggsave(
+  "alpha_sig_males.png",
+  plot = alpha_sig_males,
+  width = 10,
+  height = 6,
+  dpi = 600
+)
+```
+
+################# Differential abundance workflow #################
+Load in relative abundance data for MaAsLin2 (males and females separately; Fig. S2E & F)
+```{r}
+input_data <- read_tsv("merged_df_final_abundance_m.tsv")
+input_data <- input_data %>% column_to_rownames(var = names(input_data)[1])
+input_data <- t(input_data)
+input_metadata <- read_tsv("meta_data_m.tsv")
+input_metadata <- input_metadata %>% column_to_rownames(var = names(input_metadata)[1])
+```
+
+MaAsLin2 analysis
+```{r}
+Maaslin2(
+        input_data,
+        input_metadata,
+        output = "maaslin2_results_m_li",
+        min_abundance = 0.0001,
+        min_prevalence = 0.50,
+        normalization = "NONE",
+        transform = "LOG",
+        analysis_method = "LM",
+        max_significance = 0.05,
+        random_effects = NULL,
+        fixed_effects = "Group",
+        correction = "BH",
+        standardize = TRUE,
+        plot_heatmap = TRUE,
+        heatmap_first_n = 50,
+        plot_scatter = TRUE,
+        max_pngs = 10,
+        save_scatter = FALSE,
+        save_models = FALSE,
+        reference = NULL
+    )
+```
+
+Plotting results from MaAsLin2
+Load in MaAsLin2 results (males and females separately)
+```{r}
+path <- "~/Desktop/all_results.tsv"
+maaslin2_res <- read_tsv(path)
+```
+
+Plot horizontal bar chart using ggplot2
+```{r}
+# Keep only significant features
+sig_results <- maaslin2_res %>%
+  filter(qval < 0.10)
+
+# Order taxa by effect size
+sig_results <- sig_results %>%
+  arrange(coef) %>%
+  mutate(feature = factor(feature, levels = feature))
+
+# Match beta diversity palette
+fill_colors <- c(
+  "Decreased" = "#4D4D4D",
+  "Increased" = "#FE8A13"
+)
+
+# Add direction column
+sig_results <- sig_results %>%
+  mutate(Direction = ifelse(coef > 0,
+                            "Increased",
+                            "Decreased"))
+
+# Plot
+ggplot(sig_results,
+       aes(x = coef,
+           y = feature,
+           fill = Direction)) +
+  
+  geom_col(
+    width = 0.8,
+    color = "gray50"
+  ) +
+  
+  geom_vline(
+    xintercept = 0,
+    linetype = "solid",
+    color = "gray50",
+    linewidth = 0.7
+  ) +
+  
+  scale_fill_manual(values = fill_colors) +
+  
+  labs(
+    title = "Differentially Abundant Species - Large Intestine Males",
+    x = "MaAsLin2 Coefficient",
+    y = NULL,
+    fill = NULL
+  ) +
+  
+  theme_bw() +
+  
+  theme(
+    plot.title = element_text(
+      size = 16,
+      face = "bold",
+      hjust = 0.5
+    ),
+    
+    axis.text.y = element_text(face = "italic"),
+    
+    axis.text = element_text(size = 12),
+    
+    axis.title = element_text(
+      size = 14,
+      face = "bold"
+    ),
+    
+    legend.title = element_text(
+      size = 12,
+      face = "bold"
+    ),
+    
+    legend.text = element_text(size = 11),
+    
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    
+    axis.line = element_line(color = "black"),
+    
+    legend.position = "top"
+  )
+```
+
+Save plot
+```{r}
+ggsave(
+  "maaslin2_barplot_males.png",
+  width = 12,
+  height = 6,
+  dpi = 600
+)
+```

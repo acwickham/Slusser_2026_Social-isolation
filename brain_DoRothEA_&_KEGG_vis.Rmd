@@ -1,0 +1,1040 @@
+---
+title: "TF_activity_inference"
+author: "Amelia Slusser"
+date: "2026-05-19"
+output: html_document
+---
+################################################################################
+Tools: decoupleR (DoRothEA regulons)
+Input: global proteomics from female mice
+Output: Active TFs
+################################################################################
+ 
+==============================================================================
+0. INSTALL AND LOAD PACKAGES
+==============================================================================
+
+```{r}
+library(tidyverse)
+library(decoupleR)   
+library(OmnipathR)   
+library(readxl)
+library(readr)
+library(dplyr)
+library(ComplexHeatmap)
+library(circlize)
+library(viridis)
+library(ggplot2)
+```
+
+==============================================================================
+1. LOAD AND PREPARE PROTEOMICS DATA
+==============================================================================
+ --- What your input file should look like ---
+ A tab- or comma-separated file with at minimum:
+  - A column of mouse gene symbols (e.g. "Gene.names" from MaxQuant)
+   - A column of quantitative values per sample
+     (LFQ intensity, iBAQ, TMT ratio, or fold-change vs. control)
+
+ Example structure (MaxQuant proteinGroups.txt):
+   Gene.names | LFQ.intensity.sample1 | LFQ.intensity.sample2 | ...
+   Camk2a     | 4.2e8                 | 3.9e8                 | ...
+
+ Adjust the path and column names below to match your actual file.
+```{r}
+df_raw <- as.data.frame(read_xlsx("data.xlsx"))
+```
+
+ --- Create row names ---
+```{r}
+rownames(df_raw) <- df_raw[,1]
+df_raw <- df_raw[,-1]
+```
+ 
+# --- Convert to matrix ---
+ Rows = genes, columns = samples
+```{r}
+cort_mat <- as.matrix(df_raw)
+```
+ 
+ Quick sanity check: should print gene symbols and sample names
+```{r}
+cat("Matrix dimensions:", dim(cort_mat), "\n")
+cat("Sample names:", colnames(cort_mat), "\n")
+cat("First few gene symbols:", head(rownames(cort_mat)), "\n")
+```
+
+ ==============================================================================
+ 2. DOROTHEA: INFER DIFFERENTIAL TF ACTIVITY
+ ==============================================================================
+   Per-sample: run decoupleR on all 12 samples, then test whether scores
+       differ between groups. Gives richer statistics and per-sample variance
+
+ --- Load DoRothEA mouse regulons ---
+ get_collectri() is the recommended up-to-date regulon source in decoupleR.
+ It supersedes the older DoRothEA v2 but uses the same confidence-tier logic.
+ organism = 9606 is human; use 10090 for mouse.
+
+```{r}
+regulons <- get_collectri(organism = "10090", split_complexes = FALSE)
+```
+
+ Preview regulon structure:
+ source = TF gene symbol, target = regulated gene, mor = mode of regulation (+1 activated, -1 repressed)
+```{r}
+head(regulons)
+```
+
+Export regulon table (only need this once)
+```{r}
+write_tsv(regulons, "DoRothEA_regulons_all.tsv")
+```
+
+ --- Per-sample scores then group comparison ---
+Define which columns belong to which group 
+```{r}
+control_cols <- c("CORT_1L",	"CORT_1N",	"CORT_1R",	"CORT_3L",	"CORT_3N",	"CORT_3R")
+ 
+stress_cols  <- c("CORT_5",	"CORT_6",	"CORT_7",	"CORT_11",	"CORT_12",	"CORT_13")
+ 
+all_sample_cols <- c(control_cols, stress_cols)
+```
+
+Run all samples together using MLM
+```{r}
+tf_per_sample <- run_mlm(
+  mat     = cort_mat,
+  net     = regulons,
+  .source = "source",
+  .target = "target",
+  .mor    = "mor",
+  sparse  = FALSE,
+  center  = FALSE,
+  na.rm   = FALSE,
+  minsize = 5
+)
+```
+
+ Add group labels to per-sample scores
+```{r}
+group_labels <- tibble(
+  condition = c(control_cols, stress_cols),
+  group     = c(rep("control", length(control_cols)),
+                rep("stress",  length(stress_cols)))
+)
+ 
+tf_per_sample_grouped <- tf_per_sample %>%
+  left_join(group_labels, by = "condition")
+```
+ 
+ Test TF activity difference between groups (Welch t-test per TF)
+```{r}
+tf_group_test <- tf_per_sample_grouped %>%
+  group_by(source) %>%
+  summarise(
+    mean_ctrl       = mean(score[group == "control"], na.rm = TRUE),
+    mean_stress     = mean(score[group == "stress"],  na.rm = TRUE),
+    sd_ctrl         = sd(score[group == "control"],   na.rm = TRUE),
+    sd_stress       = sd(score[group == "stress"],    na.rm = TRUE),
+    p_value         = tryCatch(
+      t.test(score[group == "stress"],
+             score[group == "control"])$p.value,
+      error = function(e) NA_real_
+    ),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    p_adj        = p.adjust(p_value, method = "BH"),
+    delta_score  = mean_stress - mean_ctrl,
+    direction    = if_else(delta_score > 0,
+                           "more_active_in_stress", "less_active_in_stress")
+  ) %>%
+  filter(!is.na(p_value)) %>%
+  arrange(p_adj)
+ 
+sig_tf_group <- tf_group_test %>%
+  filter(p_adj < 0.05, abs(delta_score) > 0.5) 
+
+sig_tf_group <- sig_tf_group %>%
+  rename(TF = source)
+ 
+cat("\nDifferentially active TFs (per-sample method):", nrow(sig_tf_group), "\n")
+
+write_tsv(tf_per_sample_grouped, "TF_per_sample_grouped.tsv")
+write_tsv(tf_group_test, "TF_activity_per_group.tsv")
+write_tsv(sig_tf_group, "Sig_only_TF_activity_per_group.tsv")
+```
+
+ ==============================================================================
+ 3. VISUALIZE DIFFERENTIAL TF ACTIVITY
+ ==============================================================================
+ 
+ --- Volcano-style plot of TF activity scores ---
+```{r}
+ggplot(tf_group_test %>% filter(!is.na(p_adj)),
+       aes(x = delta_score, y = -log10(p_adj),
+           color = p_adj < 0.05 & abs(delta_score) > 0.5)) +
+  geom_point(alpha = 0.7, size = 2) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", alpha = 0.5) +
+  geom_vline(xintercept = c(-0.5, 0.5), linetype = "dashed", alpha = 0.5) +
+  ggrepel::geom_text_repel(
+    data = . %>% filter(p_adj < 0.05, abs(delta_score) > 0.5),
+    aes(label = source), size = 3, max.overlaps = 20
+  ) +
+  scale_color_manual(values = c("FALSE" = "gray70", "TRUE" = "#1D9E75"),
+                     guide = "none") +
+  labs(title  = "Differential TF activity: stress vs. control",
+       x      = "Delta activity score (stress - control)",
+       y      = "-log10(adjusted p-value)") +
+  theme_minimal(base_size = 12)
+ 
+ggsave("TF_activity_volcano.pdf", width = 8, height = 6)
+```
+ 
+  --- Heatmap of top TF activity scores per sample (Fig. S6B & C) ---
+```{r}
+# ── Setup ──────────────────────────────────────────────────────────────
+
+sample_order <- c(control_cols, stress_cols)
+
+group_vector <- c(rep("Control", length(control_cols)),
+                  rep("Stress",  length(stress_cols)))
+names(group_vector) <- sample_order
+
+# Only keep samples that are actually present in tf_per_sample
+sample_order_present <- intersect(sample_order, unique(tf_per_sample$condition))
+group_vector_present <- group_vector[sample_order_present]
+
+ha_col <- HeatmapAnnotation(
+  Group = factor(
+    group_vector_present,
+    levels = c("Control", "Stress")
+  ),
+  col = list(
+    Group = c(
+      Control = "#4D4D4D",
+      Stress  = "#FE8A13"
+    )
+  ),
+  border = TRUE
+)
+
+# Helper function to safely build heatmap matrix from MLM output
+make_tf_heatmap_matrix <- function(tf_names, tf_per_sample, sample_order_present) {
+  
+  heatmap_data <- tf_per_sample %>%
+    filter(source %in% tf_names) %>%
+    select(source, sample = condition, score) %>%
+    pivot_wider(
+      names_from = sample,
+      values_from = score
+    ) %>%
+    column_to_rownames("source") %>%
+    as.matrix()
+  
+  # Keep only expected samples, preserving order
+  heatmap_data <- heatmap_data[
+    ,
+    intersect(sample_order_present, colnames(heatmap_data)),
+    drop = FALSE
+  ]
+  
+  # Remove rows with all NA values
+  heatmap_data <- heatmap_data[rowSums(!is.na(heatmap_data)) > 0, , drop = FALSE]
+  
+  # Row-scale
+  heatmap_data_scaled <- t(scale(t(heatmap_data)))
+  
+  # Replace NaN values caused by zero variance rows
+  heatmap_data_scaled[is.nan(heatmap_data_scaled)] <- 0
+  
+  return(heatmap_data_scaled)
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HEATMAP 1 - Top 50 TFs by absolute delta score
+# ══════════════════════════════════════════════════════════════════════════════
+
+group_tf_names <- tf_group_test %>%
+  slice_max(abs(delta_score), n = 50) %>%
+  pull(source)
+
+heatmap_data_scaled <- make_tf_heatmap_matrix(
+  tf_names = group_tf_names,
+  tf_per_sample = tf_per_sample,
+  sample_order_present = sample_order_present
+)
+
+# Stop early with a useful message if no TFs are available
+if (nrow(heatmap_data_scaled) == 0) {
+  stop("No TFs available for Heatmap 1. Check whether tf_per_sample$source matches tf_group_test$source.")
+}
+
+sig_df <- tf_group_test %>%
+  filter(source %in% rownames(heatmap_data_scaled)) %>%
+  distinct(source, p_adj, delta_score) %>%
+  mutate(
+    sig_label = case_when(
+      p_adj < 0.05 ~ "*",
+      TRUE ~ ""
+    )
+  )
+
+sig_df <- sig_df[
+  match(rownames(heatmap_data_scaled), sig_df$source),
+]
+
+p_col_fun <- colorRamp2(
+  c(1, 0.05, 0.01, 0),
+  c("#F0F0F0", "#FDBBA1", "#FB6A4A", "#EF3B2C")
+)
+
+ha_row <- rowAnnotation(
+  
+  Adj_FDR = anno_simple(
+    sig_df$p_adj,
+    col = p_col_fun,
+    pch = sig_df$sig_label,
+    pt_gp = grid::gpar(
+      fontsize = 9,
+      fontface = "bold",
+      col = "black"
+    ),
+    width = unit(3, "mm"),
+    border = TRUE
+  ),
+  
+  "Delta activity score\n(stress−ctrl)" = anno_barplot(
+    sig_df$delta_score,
+    gp = grid::gpar(
+      fill = ifelse(sig_df$delta_score > 0,
+                    "#FE8A13",
+                    "#4D4D4D"),
+      col = NA
+    ),
+    axis_param = list(
+      gp = grid::gpar(fontsize = 7)
+    ),
+    width = unit(2.5, "cm")
+  ),
+  
+  show_annotation_name = c(Adj_FDR = FALSE)
+)
+
+ht1 <- Heatmap(
+  heatmap_data_scaled,
+  name               = "TF Activity\n(row-scaled)",
+  top_annotation     = ha_col,
+  right_annotation   = ha_row,
+  col                = viridis(100),
+  width              = unit(8, "cm"),
+  cluster_columns    = FALSE,
+  cluster_rows       = TRUE,
+  show_row_names     = TRUE,
+  show_column_names  = TRUE,
+  row_names_gp       = grid::gpar(fontsize = 9),
+  column_names_gp    = grid::gpar(fontsize = 9),
+  column_title       = "TF Activity"
+)
+
+pdf("TF_activity_heatmap_all_MLM.pdf", width = 8, height = 8)
+draw(ht1, heatmap_legend_side = "right", annotation_legend_side = "right")
+dev.off()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HEATMAP 2 - Significant TFs only
+# ══════════════════════════════════════════════════════════════════════════════
+
+group_tf_names_sig <- sig_tf_group %>%
+  slice_max(abs(delta_score), n = 50) %>%
+  pull(TF)
+
+# Only make this heatmap if significant TFs exist
+if (length(group_tf_names_sig) == 0) {
+  
+  message("No significant TFs found using p_adj < 0.05 and abs(delta_score) > 0.5. Skipping significant-only heatmap.")
+  
+} else {
+  
+  heatmap_data_scaled_sig <- make_tf_heatmap_matrix(
+    tf_names = group_tf_names_sig,
+    tf_per_sample = tf_per_sample,
+    sample_order_present = sample_order_present
+  )
+  
+  if (nrow(heatmap_data_scaled_sig) == 0) {
+    stop("No TFs available for Heatmap 2 after filtering significant TFs.")
+  }
+  
+  delta_scores_sig <- sig_tf_group %>%
+    filter(TF %in% rownames(heatmap_data_scaled_sig)) %>%
+    arrange(match(TF, rownames(heatmap_data_scaled_sig))) %>%
+    pull(delta_score)
+  
+  ha_row_sig <- rowAnnotation(
+    "Delta activity score\n(stress−ctrl)" = anno_barplot(
+      delta_scores_sig,
+      gp = grid::gpar(
+        fill = ifelse(delta_scores_sig > 0,
+                      "#FE8A13",
+                      "#4D4D4D"),
+        col = NA
+      ),
+      axis_param = list(
+        gp = grid::gpar(fontsize = 7)
+      ),
+      width = unit(2.5, "cm")
+    )
+  )
+  
+  ht2 <- Heatmap(
+    heatmap_data_scaled_sig,
+    name               = "TF Activity\n(row-scaled)",
+    top_annotation     = ha_col,
+    right_annotation   = ha_row_sig,
+    col                = viridis(100),
+    width              = unit(8, "cm"),
+    cluster_columns    = FALSE,
+    cluster_rows       = TRUE,
+    show_row_names     = TRUE,
+    show_column_names  = TRUE,
+    row_names_gp       = grid::gpar(fontsize = 9),
+    column_names_gp    = grid::gpar(fontsize = 9),
+    column_title       = "TF Activity, significant by group comparison"
+  )
+  
+  pdf("TF_activity_heatmap_sig_MLM.pdf", width = 10, height = 8)
+  draw(ht2, heatmap_legend_side = "right", annotation_legend_side = "right")
+  dev.off()
+}
+```
+
+Export the heat map data
+```{r}
+# Convert scaled heatmap matrix to a data frame
+# and preserve TF names in the first column
+heatmap_df <- heatmap_data_scaled %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column(var = "TF")
+
+# Export to Excel
+writexl::write_xlsx(
+  heatmap_df,
+  path = "TF_activity_heatmap_data_scaled.xlsx"
+)
+```
+
+ ==============================================================================
+ 4. EXPLAIN WHICH PROTEINS DROVE EACH TF INFERENCE
+ ==============================================================================
+ For every significant TF, show which detected proteins contributed to its
+ inferred activity score, and how that contribution differs between groups.
+```{r}
+explain_tf_drivers <- function(tf_name, regulons, pfc_mat,
+                               ctrl_cols, stress_cols) {
+  # Targets of this TF in the regulon
+  tf_targets <- regulons %>%
+    filter(source == tf_name) %>%
+    select(target, mor)
+ 
+  # Targets that appear in the data
+  detected <- tf_targets %>%
+    filter(target %in% rownames(pfc_mat)) %>%
+    mutate(
+      mean_ctrl   = rowMeans(pfc_mat[target, ctrl_cols,   drop = FALSE],
+                             na.rm = TRUE),
+      mean_stress = rowMeans(pfc_mat[target, stress_cols, drop = FALSE],
+                             na.rm = TRUE),
+      log2FC      = mean_stress - mean_ctrl,
+      # Weighted contribution: direction of regulation × fold-change
+      # Positive = supports TF being more active in stress
+      # Negative = supports TF being less active in stress
+      weighted_contribution = mor * log2FC
+    ) %>%
+    arrange(desc(abs(weighted_contribution)))
+ 
+  detected
+}
+```
+
+```{r}
+# Run for all TFs and save a combined driver table
+all_drivers <- map_dfr(sig_tf_group$TF, function(tf) {
+  explain_tf_drivers(tf, regulons, pfc_mat, control_cols, stress_cols) %>%
+    mutate(
+      inferred_TF   = tf,
+      TF_direction  = sig_tf_group$direction[sig_tf_group$TF == tf],
+      delta_score   = sig_tf_group$delta_score[sig_tf_group$TF == tf]
+    )
+}, .progress = TRUE)
+
+# Flag the most influential drivers: top contributors per TF
+key_drivers <- all_drivers %>%
+  group_by(inferred_TF) %>%
+  slice_max(abs(weighted_contribution), n = 10) %>%
+  ungroup() %>%
+  arrange(inferred_TF, desc(abs(weighted_contribution)))
+
+write_tsv(all_drivers, "TF_driver_proteins_all_group.tsv")
+write_tsv(key_drivers, "TF_driver_proteins_top10_group.tsv")
+
+cat("\nDriver tables saved.\n")
+cat("Columns in driver table:\n")
+cat("  target                = detected protein that contributed\n")
+cat("  mor                   = mode of regulation (+1 activated, -1 repressed)\n")
+cat("  mean_ctrl/mean_stress = log2 abundance in each group\n")
+cat("  log2FC                = stress - control log2 abundance difference\n")
+cat("  weighted_contribution = mor x log2FC (positive = supports TF being\n")
+cat("                          more active in stress)\n")
+cat("  inferred_TF           = which TF this protein helped infer\n")
+cat("  TF_direction          = more/less_active_in_stress\n")
+cat("  delta_score           = delta score\n")
+```
+
+ ══════════════════════════════════════════════════════════════════════════════
+ 5. Specific TF violin plots (Fig. 6B & C)
+ ══════════════════════════════════════════════════════════════════════════════
+ Plotting function
+```{r}
+plot_tf_violin <- function(tf_scores,
+                           tf_list = c("Esr1"),
+                           brain_region = "CORT",
+                           sex_label = "F") {
+  # Filter selected TFs
+  df <- tf_scores %>%
+    filter(source %in% tf_list) %>%
+    mutate(
+      group = factor(group,
+                     levels = c("control", "stress"),
+                     labels = c("Control", "Stress")),
+      TF = factor(source,
+                  levels = tf_list),
+      Group_num = as.numeric(group)
+    )
+  # ----- Statistics -----
+  sig_list <- lapply(levels(df$TF), function(tf) {
+    df_tf <- df %>%
+      filter(TF == tf)
+    val1 <- df_tf$score[df_tf$group == "Control"]
+    val2 <- df_tf$score[df_tf$group == "Stress"]
+    if(length(val1) > 1 & length(val2) > 1) {
+      test <- wilcox.test(
+        val1,
+        val2,
+        exact = FALSE
+      )
+      p <- test$p.value
+      sig <- ifelse(
+        p < 0.001, "***",
+        ifelse(
+          p < 0.01, "**",
+          ifelse(
+            p < 0.05, "*", "ns"
+          )
+        )
+      )
+      p_label <- ifelse(
+        p < 0.001,
+        paste0(sig),
+        paste0(sig)
+      )
+      return(
+        data.frame(
+          TF = tf,
+          x_start = 1,
+          x_end = 2,
+          label = p_label,
+          sig = sig,
+          p_value = p
+        )
+      )
+    }
+    return(NULL)
+  })
+
+  sig_df <- bind_rows(sig_list) %>%
+  mutate(
+    group1 = x_start,
+    group2 = x_end
+  )
+  
+  # Calculate an annotation position separately for each TF
+tf_y_positions <- df %>%
+  group_by(TF) %>%
+  summarise(
+    y_min = min(score, na.rm = TRUE),
+    y_max = max(score, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    y_range = y_max - y_min,
+    y_range = if_else(y_range > 0, y_range, 1),
+    
+    # Position bracket slightly above the highest observation
+    y.position = y_max + 0.08 * y_range
+  )
+
+sig_df <- sig_df %>%
+  left_join(tf_y_positions, by = "TF")
+
+   # ----- Base Plot -----
+  p <- ggplot(
+    df,
+    aes(
+      x = Group_num,
+      y = score,
+      fill = group
+    )
+  ) +
+    geom_violin(
+      trim = FALSE,
+      alpha = 0.7
+    ) +
+    geom_boxplot(
+      width = 0.1,
+      outlier.shape = NA,
+      alpha = 0.5,
+      color = "black"
+    ) +
+    geom_jitter(
+      width = 0.15,
+      alpha = 0.7,
+      size = 2,
+      color = "black"
+    ) +
+    facet_wrap(
+      ~ TF,
+      scales = "free_y"
+    ) +
+    scale_x_continuous(
+      breaks = 1:2,
+      labels = levels(df$group)
+    ) +
+    scale_fill_manual(
+      values = c(
+        "Control" = "#4D4D4D",
+        "Stress"  = "#FE8A13"
+      )
+    ) +
+    scale_y_continuous(
+      expand = expansion(mult = c(0.05, 0.16))
+    ) +
+    theme_bw() +
+    theme(
+      plot.title = element_text(
+        size = 16,
+        face = "bold",
+        hjust = 0.5
+      ),
+      axis.text.x = element_text(
+        size = 16,
+        face = "bold"
+      ),
+      axis.text.y = element_text(size = 10),
+      strip.text = element_text(
+        size = 14,
+        face = "bold"
+      ),
+      axis.title.y = element_text(
+        size = 16,
+        face = "bold"
+      ),
+      legend.position = "none"
+    ) +
+    labs(
+      x = NULL,
+      y = "Activity Score",
+      title = paste(
+        brain_region,
+        "- Estrogen Receptor Activity"
+        )
+      )
+ # ----- Add significance brackets and stars -----
+if (!is.null(sig_df) && nrow(sig_df) > 0) {
+  
+  p <- p +
+    ggpubr::stat_pvalue_manual(
+      sig_df,
+      label = "sig",
+      xmin = "group1",
+      xmax = "group2",
+      y.position = "y.position",
+      tip.length = 0.02,
+      bracket.size = 0.8,
+      size = 7,
+      vjust = -0.1,
+      color = "black",
+      hide.ns = FALSE,
+      inherit.aes = FALSE
+    )
+    }
+  return(p)
+}
+```
+ 
+Run the plotting function
+```{r}
+p_esr <- plot_tf_violin(
+  tf_scores = tf_per_sample_grouped,
+  tf_list = c("Esr1"),
+  brain_region = "CORT"
+)
+
+p_esr
+```
+
+Save output as a pdf
+```{r}
+ggsave(
+  "ESR_TF_activity_violin.pdf",
+  p_esr,
+  width = 5,
+  height = 7
+)
+```
+
+ ══════════════════════════════════════════════════════════════════════════════
+ 6. Bubble plot visualization of KEGG estrogen signaling pathway proteins (Fig. S6D & E)
+ ══════════════════════════════════════════════════════════════════════════════
+ KEGG estrogen signaling annotation was performed on detected proteins using the STRING database
+```{r}
+library(tidyverse)
+library(readxl)
+library(writexl)
+```
+
+################################## Hippocampus ##################################
+Load data (Hippocampus)
+```{r}
+intensity_df <- read_excel("f_hpc_imputed_values.xlsx")
+pval_df <- read_excel("f_hpc_pca_weighted_drivers.xlsx")
+```
+
+Prepare data to plot (Hippocampus)
+```{r}
+# Choose proteins to plot
+proteins_to_plot <- c(
+  "Akt1", "Atf2", "Ctsd", "Gnai2", "Gnaq", "Hspa1b", "Hspa8", "Hsp90aa1", "Hsp90ab1", "Hsp90b1", "Kras", "Map2k1", "Map2k2", "Pik3r2", "Plcb1")
+
+# Define group replicate columns
+control_cols <- c(
+  "HPC_1R",
+  "HPC_1L",
+  "HPC_1N",
+  "HPC_3R",
+  "HPC_3L",
+  "HPC_3N"
+)
+
+stress_cols <- c(
+  "HPC_5",
+  "HPC_6",
+  "HPC_7",
+  "HPC_11",
+  "HPC_12",
+  "HPC_13"
+)
+
+# Prepare intensity data
+plot_intensity_df <- intensity_df %>%
+  filter(Gene %in% proteins_to_plot) %>%
+  rowwise() %>%
+  mutate(
+    Control_Avg = mean(c_across(all_of(control_cols)), na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  select(
+    Gene,
+    Control_Avg,
+    all_of(stress_cols)
+  ) %>%
+  pivot_longer(
+    cols = all_of(stress_cols),
+    names_to = "Stress_Replicate",
+    values_to = "Stress_Intensity"
+  ) %>%
+  mutate(
+    Replicate_log2FC = Stress_Intensity - Control_Avg
+  )
+
+# Adjusted p-vals
+plot_pval_df <- pval_df %>%
+  filter(Gene %in% proteins_to_plot) %>%
+  select(
+    Gene,
+    adj.P.Val
+  ) %>%
+  mutate(
+    neg_log10_adj_p = -log10(adj.P.Val)
+  )
+
+# Join intensity and p-value data + define significance
+bubble_df <- plot_intensity_df %>%
+  left_join(plot_pval_df, by = "Gene") %>%
+  mutate(
+    Significance = case_when(
+      adj.P.Val < 0.05 & Replicate_log2FC > 0  ~ "Significant Up",
+      adj.P.Val < 0.05 & Replicate_log2FC < -0 ~ "Significant Down",
+      TRUE ~ "Not significant"
+    ),
+    Significant = if_else(Significance == "Not significant", "No", "Yes"),
+    Gene = factor(Gene, levels = rev(proteins_to_plot)),
+    Stress_Replicate = factor(Stress_Replicate, levels = stress_cols)
+  )
+
+# Save plot data
+write_xlsx(
+  bubble_df,
+  path = "HPC_estrogen_df.xlsx"
+)
+```
+
+Plot (Hippocampus)
+```{r}
+bubble_plot <- ggplot(
+  bubble_df,
+  aes(
+    x = Stress_Replicate,
+    y = Gene
+  )
+) +
+  
+  # All bubbles
+  geom_point(
+    aes(
+      size = neg_log10_adj_p,
+      fill = Replicate_log2FC
+    ),
+    shape = 21,
+    color = "black",
+    stroke = 0.3,
+    alpha = 0.85
+  ) +
+  
+  # Significant bubbles overlaid with thicker black outline
+  geom_point(
+    data = bubble_df %>%
+      filter(Significant == "Yes"),
+    aes(
+      size = neg_log10_adj_p,
+      fill = Replicate_log2FC
+    ),
+    shape = 21,
+    color = "black",
+    stroke = 1.4,
+    alpha = 1
+  ) +
+  
+  scale_fill_gradient2(
+    low = "#2166AC",
+    mid = "white",
+    high = "#B2182B",
+    midpoint = 0,
+    name = "Replicate Log2FC\nvs Control Avg"
+  ) +
+  
+  scale_size_continuous(
+    name = expression(-Log[10]("adj. p-value")),
+    range = c(2, 9)
+  ) +
+  
+  # Force adjusted p-value legend above color legend
+  guides(
+    size = guide_legend(order = 1),
+    fill = guide_colorbar(order = 2)
+  ) +
+  
+  labs(
+    x = "Stress replicate",
+    y = NULL,
+    title = "HPC detected estrogen signaling pathway proteins (KEGG: mmu04915)",
+    caption = "Thick black outline = significant proteins: adj. p-value < 0.05 and group |Log2FC| > 2"
+  ) +
+  
+  theme_bw(base_size = 13) +
+  theme(
+    panel.grid.major = element_line(color = "gray90"),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.caption = element_text(hjust = 0),
+    legend.position = "right"
+  )
+
+bubble_plot
+```
+
+Save the plot (Hippocampus)
+```{r}
+ggsave(
+  filename = "female_HPC_ES_protein_bubble_plot.pdf",
+  plot = bubble_plot,
+  width = 9.5,
+  height = 6
+)
+```
+
+################################## Cortex ##################################
+Load data (Cortex)
+```{r}
+intensity_df <- read_excel("f_cort_imputed_values.xlsx")
+pval_df <- read_excel("f_cort_pca_weighted_drivers.xlsx")
+```
+
+Prepare data to plot (Cortex)
+```{r}
+# Choose proteins to plot
+proteins_to_plot <- c(
+  "Adcy9", "Atf2", "Ctsd", "Fkbp5", "Gnai1", "Gnai2", "Gnao1", "Gnaq", "Hspa1a", "Hspa1b", "Hspa8", "Hsp90aa1", "Hsp90ab1", "Hsp90b1", "Kras", "Map2k2", "Nras", "Plcb1")
+
+# Define group replicate columns
+control_cols <- c(
+  "CORT_1R",
+  "CORT_1L",
+  "CORT_1N",
+  "CORT_3R",
+  "CORT_3L",
+  "CORT_3N"
+)
+
+stress_cols <- c(
+  "CORT_5",
+  "CORT_6",
+  "CORT_7",
+  "CORT_11",
+  "CORT_12",
+  "CORT_13"
+)
+
+# Prepare intensity data
+plot_intensity_df <- intensity_df %>%
+  filter(Gene %in% proteins_to_plot) %>%
+  rowwise() %>%
+  mutate(
+    Control_Avg = mean(c_across(all_of(control_cols)), na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  select(
+    Gene,
+    Control_Avg,
+    all_of(stress_cols)
+  ) %>%
+  pivot_longer(
+    cols = all_of(stress_cols),
+    names_to = "Stress_Replicate",
+    values_to = "Stress_Intensity"
+  ) %>%
+  mutate(
+    Replicate_log2FC = Stress_Intensity - Control_Avg
+  )
+
+# Adjusted p-vals
+plot_pval_df <- pval_df %>%
+  filter(Gene %in% proteins_to_plot) %>%
+  select(
+    Gene,
+    adj.P.Val
+  ) %>%
+  mutate(
+    neg_log10_adj_p = -log10(adj.P.Val)
+  )
+
+# Join intensity and p-value data + define significance
+bubble_df <- plot_intensity_df %>%
+  left_join(plot_pval_df, by = "Gene") %>%
+  mutate(
+    Significance = case_when(
+      adj.P.Val < 0.05 & Replicate_log2FC > 0  ~ "Significant Up",
+      adj.P.Val < 0.05 & Replicate_log2FC < -0 ~ "Significant Down",
+      TRUE ~ "Not significant"
+    ),
+    Significant = if_else(Significance == "Not significant", "No", "Yes"),
+    Gene = factor(Gene, levels = rev(proteins_to_plot)),
+    Stress_Replicate = factor(Stress_Replicate, levels = stress_cols)
+  )
+
+# Save plot data
+write_xlsx(
+  bubble_df,
+  path = "CORT_estrogen_df.xlsx"
+)
+```
+
+Plot
+```{r}
+bubble_plot <- ggplot(
+  bubble_df,
+  aes(
+    x = Stress_Replicate,
+    y = Gene
+  )
+) +
+  
+  # All bubbles
+  geom_point(
+    aes(
+      size = neg_log10_adj_p,
+      fill = Replicate_log2FC
+    ),
+    shape = 21,
+    color = "black",
+    stroke = 0.3,
+    alpha = 0.85
+  ) +
+  
+  # Significant bubbles overlaid with thicker black outline
+  geom_point(
+    data = bubble_df %>%
+      filter(Significant == "Yes"),
+    aes(
+      size = neg_log10_adj_p,
+      fill = Replicate_log2FC
+    ),
+    shape = 21,
+    color = "black",
+    stroke = 1.4,
+    alpha = 1
+  ) +
+  
+  scale_fill_gradient2(
+    low = "#2166AC",
+    mid = "white",
+    high = "#B2182B",
+    midpoint = 0,
+    name = "Replicate Log2FC\nvs Control Avg"
+  ) +
+  
+  scale_size_continuous(
+    name = expression(-Log[10]("adj. p-value")),
+    range = c(2, 9)
+  ) +
+  
+  labs(
+    x = "Stress replicate",
+    y = NULL,
+    title = "CORT detected estrogen signaling pathway proteins (KEGG: mmu04915)",
+    caption = "Thick black outline = significant proteins: adj. p-value < 0.05 and group |Log2FC| > 2"
+  ) +
+  
+  theme_bw(base_size = 13) +
+  theme(
+    panel.grid.major = element_line(color = "gray90"),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.caption = element_text(hjust = 0),
+    legend.position = "right"
+  )
+
+bubble_plot
+```
+
+Save the plot (Cortex)
+```{r}
+ggsave(
+  filename = "female_CORT_ES_protein_bubble_plot.pdf",
+  plot = bubble_plot,
+  width = 9.5,
+  height = 7
+)
+```

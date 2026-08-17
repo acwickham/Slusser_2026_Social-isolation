@@ -1,0 +1,2583 @@
+---
+title: "metaproteomics_visualizations"
+author: "Amelia Slusser"
+date: "2026-04-29"
+output: html_document
+---
+################################################################################
+Male
+################################################################################
+---------------------- Statistical dataframe ----------------------
+```{r}
+library(tidyverse)
+library(writexl)
+```
+
+Load and prepare data frame
+```{r}
+# Replicate data frame
+rep_df <- read_tsv("m_li_imputed_values.tsv", col_name = TRUE)
+# Stats data frame
+stats_df <- read_tsv("m_li_pca_weighted_drivers.tsv", col_name = TRUE)
+
+# Combine dataframes by Protein
+combined_df <- full_join(
+  rep_df,
+  stats_df,
+  by = "Protein",
+  suffix = c("_rep", "_stats")
+)
+
+# Export to Excel
+write_xlsx(
+  combined_df,
+  path = "m_li_stats_with_reps.xlsx"
+)
+```
+
+---------------------- Volcano plot (Fig. 3E) ----------------------
+```{r}
+library(readxl)
+library(tidyverse)
+```
+
+Load and prepare data
+```{r}
+# Load data
+volcano_df <- read_excel("m_li_pca_weighted_drivers.xlsx")
+
+# Define significance categories for plotting
+volcano_df <- volcano_df %>%
+  mutate(
+    volcano_group = case_when(
+      adj.P.Val < 0.05 & logFC > 2  ~ "Significantly increased",
+      adj.P.Val < 0.05 & logFC < -2 ~ "Significantly decreased",
+      TRUE                          ~ "Not significant"
+    ),
+    volcano_group = factor(
+      volcano_group,
+      levels = c(
+        "Significantly decreased",
+        "Not significant",
+        "Significantly increased"
+      )
+    )
+  )
+```
+
+Plot
+```{r}
+volcano_plot <- ggplot(
+  volcano_df,
+  aes(x = logFC, y = log10p, color = volcano_group)
+) +
+  
+  geom_point(
+    size = 2.2,
+    alpha = 0.85
+  ) +
+  
+  # Threshold lines
+  geom_hline(
+    yintercept = 1.3,
+    linetype = "dashed",
+    color = "gray80",
+    linewidth = 0.6
+  ) +
+  geom_vline(
+    xintercept = c(-2, 2),
+    linetype = "dashed",
+    color = "gray80",
+    linewidth = 0.6
+  ) +
+  
+  # Colors
+  scale_color_manual(
+    values = c(
+      "Significantly decreased" = "#4D4D4D",
+      "Not significant"         = "gray80",
+      "Significantly increased" = "#FE8A13"
+    )
+  ) +
+  
+  labs(
+    x = "Log2 fold change",
+    y = expression(-Log[10](p-value)),
+    color = NULL,
+    title = "M LI"
+  ) +
+  
+  theme_classic(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    axis.title = element_text(face = "plain"),
+    legend.position = "right"
+  )
+
+# View plot
+volcano_plot
+```
+
+Save
+```{r}
+ggsave(
+  filename = "male_li_volcano_plot.pdf",
+  plot = volcano_plot,
+  width = 7,
+  height = 6,
+  units = "in"
+)
+```
+
+---------------------- Stress response proteins (Fig. S3F & 3A) ----------------------
+Plot select data as a heatmap with replicates per group
+Load in packages
+```{r}
+library(readxl)
+library(dplyr)
+library(ComplexHeatmap)
+library(circlize)
+library(viridis)
+library(grid)
+library(gridtext)
+library(stringr)
+library(scales)
+```
+
+Load in data from excel spread sheets
+```{r}
+rep_df <- read_excel("m_li_imputed_values.xlsx")
+metadat_df <- read_excel("male_li_results_w_function.xlsx", sheet = "stress_regulated_selected")
+```
+
+Filter imputed values to only proteins of interest for plotting
+```{r}
+filtered_rep_df <- rep_df %>%
+  filter(Protein %in% metadat_df$Protein)
+
+# Match order between sheets to align metadata
+filtered_rep_df <- filtered_rep_df %>%
+  slice(match(metadat_df$Protein, Protein))
+```
+
+Save sig with reps file
+```{r}
+write_xlsx(filtered_rep_df, "m_li_sig_reps_stress_prot.xlsx")
+```
+
+Create dataframe that will be plotted as a heatmap
+```{r}
+heatmap_data <- filtered_rep_df %>%
+  select(starts_with("LI_")) %>%
+  as.data.frame()
+
+# Row-wise z-score scaling
+heatmap_scaled <- t(scale(t(heatmap_data)))
+
+# Assign row names
+rownames(heatmap_scaled) <- metadat_df$name
+```
+
+Order data by bin
+```{r}
+bin_order <- metadat_df %>%
+  distinct(Functional_bin) %>%
+  pull(Functional_bin)
+
+metadat_df$Functional_bin <- factor(
+  metadat_df$Functional_bin,
+  levels = bin_order
+)
+
+# Order heatmap rows
+order_idx <- order(metadat_df$Functional_bin)
+
+heatmap_scaled <- heatmap_scaled[order_idx, ]
+metadat_df <- metadat_df[order_idx, ]
+```
+
+Create italicized labels
+```{r}
+formatted_labels <- sapply(metadat_df$name, function(x) {
+
+  parts <- strsplit(x, " - ")[[1]]
+
+  species <- parts[1]
+
+  remainder <- ifelse(length(parts) > 1,
+                      paste(parts[-1], collapse = " - "),
+                      "")
+
+  paste0("<i>", species, "</i> - ", remainder)
+})
+```
+
+Annotate columns
+```{r}
+group <- c(rep("Control", 6), rep("Stress", 6))
+
+ha_col <- HeatmapAnnotation(
+  Group = group,
+  
+  col = list(
+    Group = c(
+      Control = "#4D4D4D",
+      Stress = "#FE8A13"
+    )
+  ),
+  
+  border = TRUE
+)
+```
+
+functional coloring
+```{r}
+functional_bins <- levels(droplevels(metadat_df$Functional_bin))
+
+set.seed(1)
+
+bin_colors <- structure(
+  sample(rainbow(length(functional_bins), s = 0.7, v = 0.85)),
+  names = as.character(functional_bins)
+)
+
+bin_legend <- Legend(
+  title = "Functional category",
+  labels = names(bin_colors),
+  legend_gp = gpar(fill = bin_colors),
+  ncol = 1
+)
+```
+
+Row annotation
+```{r}
+ha_row <- rowAnnotation(
+  Functional_bin = metadat_df$Functional_bin,
+  
+  col = list(
+    Functional_bin = bin_colors
+  ),
+  
+  border = TRUE,
+  
+  show_annotation_name = FALSE,
+  
+  show_legend = FALSE,
+  
+  annotation_width = unit(3, "mm")
+)
+```
+
+Plot the heatmap using viridis
+```{r}
+ht_strs <- Heatmap(
+  heatmap_scaled,
+  
+  width = unit(5, "cm"),
+  
+  name = "Z-score",
+  
+  col = viridis(100),
+  
+  top_annotation = ha_col,
+  left_annotation = ha_row,
+  
+  cluster_rows = FALSE,
+  cluster_columns = TRUE,
+  
+  row_split = metadat_df$Functional_bin,
+  
+  row_title = NULL,
+  
+  show_row_names = TRUE,
+  
+  row_labels = gt_render(formatted_labels),
+  
+  row_names_gp = gpar(fontsize = 10),
+  
+  column_names_gp = gpar(fontsize = 10),
+  
+  border = TRUE
+)
+```
+
+Draw heatmap
+```{r}
+draw(
+  ht_strs,
+  heatmap_legend_side = "left",
+  annotation_legend_side = "left",
+  annotation_legend_list = list(bin_legend)
+)
+```
+
+Save heat map as a PDF
+```{r}
+pdf(
+  "Functional_heatmap_male_li_stress_regulated.pdf",
+  width = 18,
+  height = 12
+)
+
+draw(
+  ht_strs,
+  heatmap_legend_side = "left",
+  annotation_legend_side = "left",
+  annotation_legend_list = list(bin_legend)
+)
+
+dev.off()
+```
+
+---------------------- Organism-specific stress response proteins (Fig. 3B-D) ----------------------
+```{r}
+library(tidyverse)
+library(readxl)
+library(ggpubr)
+```
+
+Load in data from excel spread sheets
+```{r}
+rep_df <- read_excel("m_li_imputed_values_male.xlsx")
+metadat_df <- read_excel("male_li_results_w_function.xlsx", sheet = "stress_regulated_selected")
+```
+
+Filter imputed values to only proteins of interest for plotting
+```{r}
+filtered_rep_df <- rep_df %>%
+  filter(Protein %in% metadat_df$Protein)
+
+# Match order between sheets to align metadata
+filtered_rep_df <- filtered_rep_df %>%
+  dplyr::slice(match(metadat_df$Protein, Protein))
+```
+
+Choose proteins to plot
+```{r}
+# P. muris
+proteins_to_plot <- c(
+  "WP_135987996.1",
+  "WP_135990045.1"
+)
+
+# A. rhamnosivorans
+#proteins_to_plot <- c(
+  #"QCP36024.1",
+  #"QCP34468.1"
+#)
+
+# A. sedimenticola
+#proteins_to_plot <- c(
+  #"QHQ59687.1",
+  #"QHQ60156.1",
+  #"QHQ60147.1"
+#)
+```
+
+Filter data
+```{r}
+plot_metadat_df <- metadat_df %>%
+  filter(Protein %in% proteins_to_plot) %>%
+  mutate(
+    Protein = factor(Protein, levels = proteins_to_plot)
+  ) %>%
+  arrange(Protein) %>%
+  select(
+    Protein,
+    Plot_Label = Function
+  )
+
+plot_rep_df <- rep_df %>%
+  filter(Protein %in% proteins_to_plot) %>%
+  mutate(
+    Protein = factor(Protein, levels = proteins_to_plot)
+  ) %>%
+  arrange(Protein)
+
+# Combine with the Function column
+sample_cols <- names(plot_rep_df) %>%
+  keep(~ str_starts(.x, "LI_"))
+
+group_key <- tibble(
+  Sample = sample_cols,
+  Group = c(rep("Control", 6), rep("Stress", 6))
+)
+
+plot_df <- plot_rep_df %>%
+  left_join(
+    plot_metadat_df,
+    by = "Protein"
+  ) %>%
+  pivot_longer(
+    cols = all_of(sample_cols),
+    names_to = "Sample",
+    values_to = "Intensity"
+  ) %>%
+  left_join(
+    group_key,
+    by = "Sample"
+  ) %>%
+  mutate(
+    Group = factor(Group, levels = c("Control", "Stress")),
+    Plot_Label = factor(Plot_Label, levels = plot_metadat_df$Plot_Label)
+  )
+
+# Calculate Control vs Stress statistics separately for each protein
+protein_stats <- plot_df %>%
+  group_by(Protein, Plot_Label) %>%
+  rstatix::t_test(
+    Intensity ~ Group,
+    comparisons = list(c("Control", "Stress")),
+    var.equal = FALSE
+  ) %>%
+  rstatix::add_significance(
+    p.col = "p",
+    output.col = "p.signif"
+  ) %>%
+  ungroup()
+
+# Calculate a facet-specific bracket position
+stat_positions <- plot_df %>%
+  group_by(Protein, Plot_Label) %>%
+  summarize(
+    y_max = max(Intensity, na.rm = TRUE),
+    y_min = min(Intensity, na.rm = TRUE),
+    y_range = y_max - y_min,
+    y.position = if_else(
+      y_range == 0,
+      y_max + 0.5,
+      y_max + 0.15 * y_range
+    ),
+    .groups = "drop"
+  )
+
+# Add bracket positions to the statistics table
+protein_stats <- protein_stats %>%
+  left_join(
+    stat_positions,
+    by = c("Protein", "Plot_Label")
+  ) %>%
+  mutate(
+    group1 = factor(group1, levels = c("Control", "Stress")),
+    group2 = factor(group2, levels = c("Control", "Stress"))
+  )
+```
+
+Plot
+```{r}
+protein_boxplot <- ggplot(
+  plot_df,
+  aes(
+    x = Group,
+    y = Intensity,
+    fill = Group
+  )
+) +
+  
+  geom_boxplot(
+    width = 0.6,
+    outlier.shape = NA,
+    color = "black",
+    linewidth = 0.7,
+    alpha = 0.85
+  ) +
+  
+  geom_jitter(
+    shape = 21,
+    color = "black",
+    width = 0.12,
+    size = 3.8,
+    stroke = 0.5,
+    alpha = 0.9
+  ) +
+  
+  # Add significance brackets and statistical stars
+  ggpubr::stat_pvalue_manual(
+    protein_stats,
+    label = "p.signif",
+    xmin = "group1",
+    xmax = "group2",
+    y.position = "y.position",
+    tip.length = 0.01,
+    bracket.size = 0.8,
+    size = 10,
+    hide.ns = FALSE,
+    inherit.aes = FALSE
+  ) +
+  
+  facet_wrap(
+    ~ Plot_Label,
+    scales = "free_y",
+    ncol = 2,
+    
+    # Wrap long facet labels at approximately 35 characters
+    labeller = labeller(
+      Plot_Label = label_wrap_gen(
+        width = 35,
+        multi_line = TRUE
+      )
+    )
+  ) +
+  
+  scale_fill_manual(
+    values = c(
+      "Control" = "#4D4D4D",
+      "Stress"  = "#FE8A13"
+    )
+  ) +
+  
+  # Add additional space above each facet for the brackets
+  scale_y_continuous(
+    expand = expansion(
+      mult = c(0.05, 0.22)
+    )
+  ) +
+  
+  labs(
+    x = NULL,
+    y = "Log2 intensity",
+    fill = NULL
+  ) +
+  
+  theme_classic(base_size = 18) +
+  
+  theme(
+    # Facet-label boxes
+    strip.background = element_rect(
+      fill = "gray85",
+      color = "black",
+      linewidth = 0.7
+    ),
+    
+    strip.text = element_text(
+      face = "bold",
+      color = "black",
+      size = 17,
+      lineheight = 1,
+      
+      # Enlarges the gray box around wrapped text
+      margin = margin(
+        t = 9,
+        r = 8,
+        b = 9,
+        l = 8
+      )
+    ),
+    
+    # Axis text
+    axis.text.x = element_text(
+      color = "black",
+      size = 17,
+      face = "bold",
+      margin = margin(t = 7)
+    ),
+    
+    axis.text.y = element_text(
+      color = "black",
+      size = 16
+    ),
+    
+    # Axis title
+    axis.title.y = element_text(
+      color = "black",
+      size = 20,
+      face = "bold",
+      margin = margin(r = 10)
+    ),
+    
+    # Additional spacing between facets
+    panel.spacing = grid::unit(1.2, "lines"),
+    
+    legend.position = "none"
+  )
+
+protein_boxplot
+```
+
+Save
+```{r}
+ggsave(
+  filename = "p._muris_selected_stress_boxplots_male_li.pdf",
+  plot = protein_boxplot,
+  width = 9.5,
+  height = 5,
+  dpi = 300
+)
+```
+
+---------------------- GH family heatmap (Fig. S5A & 5A) ----------------------
+Plot select data as a heatmap with replicates per group
+Load in packages
+```{r}
+library(readxl)
+library(dplyr)
+library(ComplexHeatmap)
+library(circlize)
+library(viridis)
+library(grid)
+library(gridtext)
+library(stringr)
+library(scales)
+```
+
+Load in data from excel spread sheets
+```{r}
+rep_df <- read_excel("m_li_imputed_values_male.xlsx")
+metadat_df <- read_excel("male_li_results_w_function.xlsx", sheet = "complex_carb_selected")
+```
+
+Filter imputed values to only proteins of interest for plotting
+```{r}
+filtered_rep_df <- rep_df %>%
+  filter(Protein %in% metadat_df$Protein)
+# Match order between sheets to align metadata (safer ordering)
+filtered_rep_df <- filtered_rep_df %>%
+  slice(match(metadat_df$Protein, Protein))
+```
+
+Save sig with reps file
+```{r}
+write_xlsx(filtered_rep_df, "m_li_gh_sig_reps.xlsx")
+```
+
+Create dataframe that will be plotted as a heatmap
+```{r}
+heatmap_data <- filtered_rep_df %>%
+  select(starts_with("LI_")) %>%
+  as.data.frame()
+
+# Row-wise z-score scaling
+heatmap_scaled <- t(scale(t(heatmap_data)))
+
+# Assign row names
+rownames(heatmap_scaled) <- metadat_df$name
+```
+
+Order data by GH family
+```{r}
+# Manually define GH family order
+gh_order <- c(
+  "GH1",
+  "GH2",
+  "GH3",
+  "GH13",
+  "GH29",
+  "GH33",
+  "GH35",
+  "GH36",
+  "GH42",
+  "GH43",
+  "GH51",
+  "GH74",
+  "GH127",
+  "GH130"
+)
+# Convert to a factor
+metadat_df$`GH family` <- factor(
+  metadat_df$`GH family`,
+  levels = gh_order
+)
+# Order heatmap rows
+order_idx <- order(metadat_df$`GH family`)
+
+heatmap_scaled <- heatmap_scaled[order_idx, ]
+metadat_df <- metadat_df[order_idx, ]
+```
+
+Create italicized labels
+```{r}
+formatted_labels <- sapply(metadat_df$name, function(x) {
+
+  parts <- strsplit(x, " - ")[[1]]
+
+  species <- parts[1]
+
+  remainder <- ifelse(length(parts) > 1,
+                      paste(parts[-1], collapse = " - "),
+                      "")
+
+  paste0("<i>", species, "</i> - ", remainder)
+})
+```
+
+Annotate columns
+```{r}
+group <- c(rep("Control", 6), rep("Stress", 6))
+
+ha_col <- HeatmapAnnotation(
+  Group = group,
+  
+  col = list(
+    Group = c(
+      Control = "#4D4D4D",
+      Stress = "#FE8A13"
+    )
+  ),
+  
+  border = TRUE
+)
+```
+
+GH family coloring
+```{r}
+gh_families <- levels(droplevels(metadat_df$`GH family`))
+
+set.seed(1)
+
+gh_colors <- structure(
+  sample(rainbow(length(gh_families), s = 0.7, v = 0.85)),
+  names = as.character(gh_families)
+)
+
+gh_legend <- Legend(
+  title = "GH Family",
+  labels = names(gh_colors),
+  legend_gp = gpar(fill = gh_colors),
+  ncol = 1
+)
+```
+
+Row annotation
+```{r}
+ha_row <- rowAnnotation(
+  GH = metadat_df$`GH family`,
+
+  col = list(GH = gh_colors),
+
+  border = TRUE, 
+  
+  show_annotation_name = FALSE,
+
+  show_legend = FALSE,
+
+  annotation_width = unit(3, "mm")
+)
+```
+
+Plot the heatmap using viridis
+```{r}
+ht <- Heatmap(
+  heatmap_scaled,
+
+  width = unit(5, "cm"),
+  
+  name = "Z-score",
+
+  col = viridis(100),
+
+  top_annotation = ha_col,
+  left_annotation = ha_row,
+
+  cluster_rows = FALSE,
+  cluster_columns = TRUE,
+
+  row_split = metadat_df$`GH family`,
+
+  row_title = NULL,
+
+  show_row_names = TRUE,
+
+  row_labels = gt_render(formatted_labels),
+
+  row_names_gp = gpar(fontsize = 10),
+
+  column_names_gp = gpar(fontsize = 10),
+
+  border = TRUE
+)
+```
+
+Draw heatmap
+```{r}
+draw(
+  ht,
+  heatmap_legend_side = "left",
+  annotation_legend_side = "left",
+  annotation_legend_list = list(gh_legend)
+)
+```
+
+Save heat map as a PDF
+```{r}
+pdf(
+  "GH_family_heatmap_male_li.pdf",
+  width =16,
+  height = 6
+)
+
+draw(
+  ht,
+  heatmap_legend_side = "left",
+  annotation_legend_side = "left",
+  annotation_legend_list = list(gh_legend)
+)
+
+dev.off()
+```
+
+---------------------- Arabinose isomerases (Fig. 5C) ----------------------
+```{r}
+library(readxl)
+library(tidyverse)
+library(ggnewscale)
+```
+
+```{r}
+# Create data frame
+arab_iso_df <- data.frame(
+  Sample = c(
+    "LI_2R", "LI_2L", "LI_2N", "LI_4R", "LI_4L", "LI_4N",
+    "LI_8", "LI_9", "LI_10", "LI_14", "LI_15", "LI_16"
+  ),
+  Log2_Intensity = c(
+    24.11368032, 22.82925275, 23.15363277, 23.66263724, 23.9576346, 23.59308378,
+    13.75938998, 13.92129068, 14.49067997, 16.3292061, 13.79934126, 16.79112359
+  )
+)
+
+# Add group information
+arab_iso_df <- arab_iso_df %>%
+  mutate(
+    Group = case_when(
+      str_detect(Sample, "Con") ~ "Control",
+      str_detect(Sample, "Strs") ~ "Stress"
+    ),
+    Group = factor(Group, levels = c("Control", "Stress"))
+  )
+
+# Plot
+arab_iso_plot <- ggplot(arab_iso_df, aes(x = Group, y = Log2_Intensity, fill = Group)) +
+  
+  stat_summary(
+    fun.data = mean_se,
+    geom = "errorbar",
+    width = 0.18,
+    linewidth = 0.6,
+    color = "black"
+  ) +
+  
+  geom_jitter(
+    shape = 21,
+    color = "black",
+    width = 0.12,
+    size = 4,
+    stroke = 0.5,
+    alpha = 0.95
+  ) +
+  
+  scale_fill_manual(
+    values = c(
+      "Control" = "#4D4D4D",
+      "Stress" = "#FE8A13"
+    )
+  ) +
+  
+  labs(
+    title = "L-arabinose isomerase",
+    x = NULL,
+    y = "log2 intensity"
+  ) +
+  
+  theme_classic(base_size = 14) +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,
+      face = "italic",
+      size = 16
+    ),
+    axis.text.x = element_text(
+      color = "black",
+      size = 13
+    ),
+    axis.text.y = element_text(
+      color = "black",
+      size = 12
+    ),
+    axis.title.y = element_text(
+      color = "black",
+      size = 14
+    ),
+    legend.position = "none"
+  )
+
+arab_iso_plot
+```
+
+More replicate data
+```{r}
+# Create data frame: one row per arabinose isomerase protein
+arab_iso_wide <- data.frame(
+  Protein = paste0("Arab_iso_", 1:8),
+  
+  LI_2R = c(25.18520163, 24.94279731, 25.29151547, 21.66082115, 22.08799437, 24.02147435, 23.79678867, 26.47895119),
+  LI_2L = c(22.09947004, 22.27698834, 23.40961778, 22.27698834, 22.20670323, 23.44770931, 21.90569884, 23.89622702),
+  LI_2N = c(24.04184345, 22.87496804, 23.11653658, 21.65988568, 22.9292736, 22.88451935, 21.27891846, 25.62418605),
+  LI_4R = c(24.32007465, 23.58292204, 24.58100694, 22.56653239, 23.15168295, 23.12491663, 22.51964181, 25.80986456),
+  LI_4L = c(22.97940175, 24.1426314, 24.23329067, 21.51574623, 23.35831294, 24.18996645, 22.51846268, 26.09262615),
+  LI_4N = c(24.19506548, 24.19506548, 24.23829669, 21.84505017, 23.31441275, 23.53604915, 21.93114633, 25.57948882),
+  
+  LI_8 = c(18.43611154, 16.18489406, 17.74539151, 11.96770412, 11.96770412, 11.96770412, 14.97787138, 15.09133125),
+  LI_9 = c(15.96524372, 16.39687652, 14.94335051, 11.04504083, 11.04504083, 11.04504083, 15.62085813, 17.67807304),
+  LI_10 = c(23.06424774, 16.19705485, 23.395165, 11.04641151, 11.04641151, 11.04641151, 17.60790938, 16.5130809),
+  LI_14 = c(16.72150384, 16.23358471, 17.30598662, 11.77021159, 11.77021159, 11.77021159, 16.5254586, 25.61600236),
+  LI_15 = c(17.08289903, 21.2699493, 17.429364, 11.50011976, 11.50011976, 11.50011976, 14.3991348, 16.45521658),
+  LI_16 = c(24.48099289, 16.72720736, 17.7793825, 9.395038869, 9.395038869, 9.395038869, 25.03149178, 23.20757735)
+)
+
+# Convert to long format
+arab_iso_long <- arab_iso_wide %>%
+  pivot_longer(
+    cols = starts_with("LI_"),
+    names_to = "Sample",
+    values_to = "Log2_Intensity"
+  ) %>%
+  mutate(
+    Group = case_when(
+      str_detect(Sample, "Con") ~ "Control",
+      str_detect(Sample, "Strs") ~ "Stress",
+      TRUE ~ NA_character_
+    ),
+    Group = factor(Group, levels = c("Control", "Stress"))
+  )
+```
+
+Connected mean summary lines
+```{r}
+arab_iso_summary <- arab_iso_long %>%
+  group_by(Protein, Group) %>%
+  summarise(
+    Mean_Log2_Intensity = mean(Log2_Intensity, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+Plot
+```{r}
+arab_iso_connected_plot <- ggplot() +
+  
+  # Replicate dots: original darker colors
+  geom_jitter(
+    data = arab_iso_long,
+    aes(
+      x = Group,
+      y = Log2_Intensity,
+      fill = Group
+    ),
+    shape = 21,
+    color = "black",
+    width = 0.16,
+    size = 5,
+    stroke = 0.4,
+    alpha = 0.95
+  ) +
+  
+    scale_fill_manual(
+    values = c(
+      "Control" = "#BDBDBD",
+      "Stress"  = "#FDBA74"
+    )
+  ) +
+  
+  ggnewscale::new_scale_fill() +
+  
+  # Faint connected protein-level mean lines
+  geom_line(
+    data = arab_iso_summary,
+    aes(
+      x = Group,
+      y = Mean_Log2_Intensity,
+      group = Protein
+    ),
+    color = "gray45",
+    linewidth = 0.7,
+    alpha = 0.5
+  ) +
+  
+  # Mean points: lighter colors and drawn last
+  geom_point(
+    data = arab_iso_summary,
+    aes(
+      x = Group,
+      y = Mean_Log2_Intensity,
+      fill = Group
+    ),
+    shape = 21,
+    color = "black",
+    size = 6.5,
+    stroke = 0.7,
+    alpha = 0.85
+  ) +
+  
+  scale_fill_manual(
+    values = c(
+      "Control" = "#4D4D4D",
+      "Stress"  = "#FE8A13"
+    )
+  ) +
+  
+  labs(
+    title = "L-arabinose isomerase LI M",
+    x = NULL,
+    y = "Log2 intensity"
+  ) +
+  
+  theme_classic(base_size = 20) +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,
+      face = "bold",
+      size = 25
+    ),
+    axis.text.x = element_text(
+      color = "black",
+      face = "bold",
+      size = 23
+    ),
+    axis.text.y = element_text(
+      color = "black",
+      size = 23
+    ),
+    axis.title.y = element_text(
+      color = "black",
+      face = "bold",
+      size = 25
+    ),
+    legend.position = "none"
+  )
+
+arab_iso_connected_plot
+```
+
+Save plot
+```{r}
+ggsave(
+  filename = "m_li_arabinose_isomerase_plot.pdf",
+  plot = arab_iso_connected_plot,
+  width = 6,
+  height = 6
+)
+```
+
+---------------------- Xylose isomerases (Fig. 5D) ----------------------
+```{r}
+library(readxl)
+library(tidyverse)
+library(ggnewscale)
+```
+
+Replicate data
+```{r}
+# Create data frame: one row per xylose isomerase protein
+xylo_iso_wide <- data.frame(
+  Protein = paste0("Xylo_iso_", 1:8),
+  
+  LI_2R = c(21.76556329, 23.14371343),
+  LI_2L = c(21.0097721, 23.13050296),
+  LI_2N = c(21.0152900, 23.66535397),
+  LI_4R = c(22.21457453, 23.9050938),
+  LI_4L = c(21.52527622, 23.38993302),
+  LI_4N = c(20.23979984, 22.13690788),
+  
+  LI_8 = c(11.96770412, 11.96770412),
+  LI_9 = c(11.04504083, 11.04504083),
+  LI_10 = c(11.04641151, 11.04641151),
+  LI_14 = c(11.77021159, 11.77021159),
+  LI_15 = c(11.50011976, 11.50011976),
+  LI_16 = c(9.395038869, 9.395038869)
+)
+
+# Convert to long format
+xylo_iso_long <- xylo_iso_wide %>%
+  pivot_longer(
+    cols = starts_with("LI_"),
+    names_to = "Sample",
+    values_to = "Log2_Intensity"
+  ) %>%
+  mutate(
+    Group = case_when(
+      str_detect(Sample, "Con") ~ "Control",
+      str_detect(Sample, "Strs") ~ "Stress",
+      TRUE ~ NA_character_
+    ),
+    Group = factor(Group, levels = c("Control", "Stress"))
+  )
+```
+
+Connected mean summary lines
+```{r}
+xylo_iso_summary <- xylo_iso_long %>%
+  group_by(Protein, Group) %>%
+  summarise(
+    Mean_Log2_Intensity = mean(Log2_Intensity, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+Plot
+```{r}
+xylo_iso_connected_plot <- ggplot() +
+  
+  # Replicate dots: original darker colors
+  geom_jitter(
+    data = xylo_iso_long,
+    aes(
+      x = Group,
+      y = Log2_Intensity,
+      fill = Group
+    ),
+    shape = 21,
+    color = "black",
+    width = 0.16,
+    size = 5,
+    stroke = 0.4,
+    alpha = 0.95
+  ) +
+  
+    scale_fill_manual(
+    values = c(
+      "Control" = "#BDBDBD",
+      "Stress"  = "#FDBA74"
+    )
+  ) +
+  
+  ggnewscale::new_scale_fill() +
+  
+  # Faint connected protein-level mean lines
+  geom_line(
+    data = xylo_iso_summary,
+    aes(
+      x = Group,
+      y = Mean_Log2_Intensity,
+      group = Protein
+    ),
+    color = "gray45",
+    linewidth = 0.7,
+    alpha = 0.5
+  ) +
+  
+  # Mean points: lighter colors and drawn last
+  geom_point(
+    data = xylo_iso_summary,
+    aes(
+      x = Group,
+      y = Mean_Log2_Intensity,
+      fill = Group
+    ),
+    shape = 21,
+    color = "black",
+    size = 6.5,
+    stroke = 0.7,
+    alpha = 0.85
+  ) +
+  
+  scale_fill_manual(
+    values = c(
+      "Control" = "#4D4D4D",
+      "Stress"  = "#FE8A13"
+    )
+  ) +
+  
+  labs(
+    title = "Xylose isomerase LI M",
+    x = NULL,
+    y = "Log2 intensity"
+  ) +
+  
+  theme_classic(base_size = 20) +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,
+      face = "bold",
+      size = 25
+    ),
+    axis.text.x = element_text(
+      color = "black",
+      face = "bold",
+      size = 23
+    ),
+    axis.text.y = element_text(
+      color = "black",
+      size = 23
+    ),
+    axis.title.y = element_text(
+      color = "black",
+      face = "bold",
+      size = 25
+    ),
+    legend.position = "none"
+  )
+
+xylo_iso_connected_plot
+```
+
+Save plot
+```{r}
+ggsave(
+  filename = "m_li_xylose_isomerase_plot.pdf",
+  plot = xylo_iso_connected_plot,
+  width = 6,
+  height = 6
+)
+```
+
+################################################################################
+Female
+################################################################################
+---------------------- Statistical dataframe ----------------------
+```{r}
+library(tidyverse)
+library(writexl)
+```
+
+Load and prepare data frame
+```{r}
+# Replicate data frame
+rep_df <- read_tsv("f_li_imputed_values.tsv", col_name = TRUE)
+# Stats data frame
+stats_df <- read_tsv("f_li_pca_weighted_drivers.tsv", col_name = TRUE)
+
+# Combine dataframes by Protein
+combined_df <- full_join(
+  rep_df,
+  stats_df,
+  by = "Protein",
+  suffix = c("_rep", "_stats")
+)
+
+# Export to Excel
+write_xlsx(
+  combined_df,
+  path = "f_li_stats_with_reps.xlsx"
+)
+```
+
+---------------------- Volcano plot (Fig. S4E) ----------------------
+```{r}
+library(readxl)
+library(tidyverse)
+```
+
+Load and prepare data
+```{r}
+# Load data
+volcano_df <- read_excel("f_li_pca_weighted_drivers.xlsx")
+
+# Define significance categories for plotting
+volcano_df <- volcano_df %>%
+  mutate(
+    volcano_group = case_when(
+      adj.P.Val < 0.05 & logFC > 2  ~ "Significantly increased",
+      adj.P.Val < 0.05 & logFC < -2 ~ "Significantly decreased",
+      TRUE                          ~ "Not significant"
+    ),
+    volcano_group = factor(
+      volcano_group,
+      levels = c(
+        "Significantly decreased",
+        "Not significant",
+        "Significantly increased"
+      )
+    )
+  )
+```
+
+Plot
+```{r}
+volcano_plot <- ggplot(
+  volcano_df,
+  aes(x = logFC, y = log10p, color = volcano_group)
+) +
+  
+  geom_point(
+    size = 2.2,
+    alpha = 0.85
+  ) +
+  
+  # Threshold lines
+  geom_hline(
+    yintercept = 1.3,
+    linetype = "dashed",
+    color = "gray80",
+    linewidth = 0.6
+  ) +
+  geom_vline(
+    xintercept = c(-2, 2),
+    linetype = "dashed",
+    color = "gray80",
+    linewidth = 0.6
+  ) +
+  
+  # Colors
+  scale_color_manual(
+    values = c(
+      "Significantly decreased" = "#4D4D4D",
+      "Not significant"         = "gray80",
+      "Significantly increased" = "#FE8A13"
+    )
+  ) +
+  
+  labs(
+    x = "Log2 fold change",
+    y = expression(-Log[10](p-value)),
+    color = NULL,
+    title = "F LI"
+  ) +
+  
+  theme_classic(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    axis.title = element_text(face = "plain"),
+    legend.position = "right"
+  )
+
+# View plot
+volcano_plot
+```
+
+Save
+```{r}
+ggsave(
+  filename = "female_li_volcano_plot.pdf",
+  plot = volcano_plot,
+  width = 7,
+  height = 5,
+  units = "in"
+)
+```
+
+---------------------- Genus stacked bar chart (Fig. S4F) ----------------------
+```{r}
+library(tidyverse)
+library(readxl)
+library(rcartocolor)
+```
+
+Read in data
+```{r}
+genus_df <- read_excel(
+  "female_li_8_2_filtered_hybrid_results_w_function.xlsx",
+  sheet = "genus"
+)
+```
+
+Prepare data
+```{r}
+# Clean genus names
+genus_df <- genus_df %>%
+  mutate(
+    Genus = if_else(is.na(Genus) | Genus == "", "Unknown", Genus)
+  )
+
+# Count total number of proteins per genus before collapsing
+genus_counts <- genus_df %>%
+  count(Genus, name = "genus_total_n")
+
+# Count how many genera will be collapsed into Other
+n_other_genera <- genus_counts %>%
+  filter(genus_total_n < 5) %>%
+  summarise(n_other = n_distinct(Genus)) %>%
+  pull(n_other)
+
+# Create a label that includes the number of genera in Other
+other_label <- paste0("Other (", n_other_genera, " genera)")
+
+# Collapse genera with fewer than 5 proteins into Other
+genus_plot_df <- genus_df %>%
+  left_join(genus_counts, by = "Genus") %>%
+  mutate(
+    Genus_plot = if_else(
+      genus_total_n < 5,
+      other_label,
+      Genus
+    )
+  ) %>%
+  count(Genus_plot, name = "n") %>%
+  mutate(
+    prop = n / sum(n)
+  )
+
+# Order genera by percent composition
+genus_order <- genus_plot_df %>%
+  arrange(prop) %>%
+  pull(Genus_plot)
+
+# Remove Other and Petralouisia so we can manually place them
+genus_order <- genus_order %>%
+  setdiff(c(other_label, "Petralouisia"))
+
+# Desired stack order from bottom to top
+genus_order <- c(
+  other_label,
+  genus_order,
+  "Petralouisia"
+)
+
+genus_plot_df <- genus_plot_df %>%
+  mutate(
+    Genus_plot = factor(Genus_plot, levels = genus_order)
+  )
+
+# Export genus plot dataframe
+write_xlsx(genus_plot_df, "genus_plot_df.xlsx")
+```
+
+Color palette for plot
+```{r}
+# Make a lighter/brighter Carto palette
+set.seed(752)  # Change this number to reshuffle colors
+
+genus_colors <- colorRampPalette(
+  carto_pal(n = 12, name = "Pastel")
+)(
+  nlevels(genus_plot_df$Genus_plot)
+)
+
+# Randomize color order so similar colors are less likely to sit next to each other
+genus_colors <- sample(genus_colors)
+
+names(genus_colors) <- levels(genus_plot_df$Genus_plot)
+
+# Keep Other gray so it stays visually de-emphasized
+genus_colors[other_label] <- "gray85"
+```
+
+Plot
+```{r}
+genus_stacked_bar_percent <- ggplot(
+  genus_plot_df,
+  aes(
+    x = "Total",
+    y = prop,
+    fill = Genus_plot
+  )
+) +
+  geom_col(
+    width = 0.6,
+    color = "black",
+    linewidth = 0.25,
+    position = position_stack(reverse = TRUE)
+  ) +
+  coord_flip() +
+  scale_fill_manual(
+    values = genus_colors,
+    breaks = rev(levels(genus_plot_df$Genus_plot))
+  ) +
+  scale_y_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  labs(
+    x = NULL,
+    y = "Percent of total significant proteins",
+    fill = "Genus"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.text.x = element_text(size = 18, color = "black"),
+    axis.title.x = element_text(size = 20, color = "black"),
+    legend.title = element_text(face = "bold"),
+    legend.text = element_text(size = 16),
+    plot.margin = margin(t = 10, r = 10, b = 10, l = 20)
+  )
+
+genus_stacked_bar_percent
+```
+
+Save
+```{r}
+ggsave(
+  filename = "genus_stacked_bar.pdf",
+  plot     = genus_stacked_bar_percent,
+  width    = 14,
+  height   = 10,
+  device   = pdf
+)
+```
+
+---------------------- Top 12 genera by protein count (Fig. 4A) ----------------------
+```{r}
+library(dplyr)
+library(ggplot2)
+library(stringr)
+library(tidyr)
+```
+
+Create data frame
+```{r}
+# Input: one row per genus, separate columns for increased and decreased counts
+df_microbe <- data.frame(
+  genus = c("Petralouisia", "Blautia", "Roseburia",
+            "Dorea", "Turicibacter", "Acutalibacter",
+            "Acetatifactor", "Romboutsia", "Clostridium",
+            "Eubacterium", "Ruminococcus", "Sporofaciens"),
+  increased = c(49, 19, 14, 4, 1, 0, 5, 2, 5, 6, 7, 1),
+  decreased = c(3, 25, 20, 29, 28, 22, 15, 18, 14, 12, 9, 13)
+)
+```
+
+Mirror: decreased becomes negative; sort genera by net change
+```{r}
+df_microbe <- df_microbe %>%
+  mutate(
+    net = increased - decreased,
+    genus = reorder(genus, net),
+    decreased_mirror = -decreased
+  ) %>%
+  pivot_longer(
+    cols = c(increased, decreased_mirror),
+    names_to = "direction",
+    values_to = "count"
+  ) %>%
+  mutate(direction = recode(direction,
+    "increased" = "Increased",
+    "decreased_mirror" = "Decreased"
+  ))
+
+# Export protein count data frame
+write_xlsx(df_microbe, "genus_protein_count.xlsx")
+```
+
+Plot diverging bar graph
+```{r}
+microbe_div_bar <- ggplot(df_microbe, aes(x = count, y = genus, fill = direction)) +
+  geom_col(
+    width = 0.7,
+    color = "black",
+    linewidth = 0.4
+  ) +
+  geom_vline(xintercept = 0, linewidth = 0.6, color = "grey40") +
+  scale_fill_manual(values = c("Increased" = "#FE8A13", "Decreased" = "#4D4D4D")) +
+  scale_x_continuous(
+    labels = function(x) abs(x),     # show absolute values on axis
+    expand = expansion(mult = 0.05)
+  ) +
+  labs(
+    x = "Number of differentially abundant proteins",
+    y = NULL,
+    fill = NULL,
+    title = "Changes in microbial protein abundance - Top 12 genera by total protein count"
+  ) +
+  theme_minimal(base_size = 23) +
+  theme(
+    legend.position = "top",
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.y = element_text(face = "italic", size = 20),
+    axis.text.x = element_text(size = 18),
+    axis.title.x = element_text(face = "bold", size = 20),
+    plot.title = element_text(face = "bold", size = 20)
+  )
+microbe_div_bar
+```
+
+Save plot
+```{r}
+ggsave(
+  "microbial_diverging_barplot.pdf",
+  microbe_div_bar,
+  width = 10,
+  height = 6,
+  dpi = 600
+)
+```
+
+---------------------- P. muris proteins and metabolic groupings heatmap (Fig. 4B) ----------------------
+```{r}
+library(tidyverse)
+library(readxl)
+library(ComplexHeatmap)
+library(circlize)
+library(viridis)
+library(grid)
+library(gridtext)
+```
+
+Load in data
+```{r}
+rep_df <- read_excel("imputed_values_female.xlsx")
+
+metadat_df <- read_excel(
+  "female_li_8_2_filtered_hybrid_results_w_function.xlsx",
+  sheet = "p_muris"
+)
+```
+
+Prepare data for plotting
+```{r}
+# Filter imputed proteins to proteins of interest
+filtered_rep_df <- rep_df %>%
+  filter(Protein %in% metadat_df$Protein)
+
+# Match order between sheets to align metadata
+filtered_rep_df <- filtered_rep_df %>%
+  slice(match(metadat_df$Protein, Protein))
+
+# Create dataframe that will be plotted as a heatmap
+heatmap_data <- filtered_rep_df %>%
+  select(starts_with("LI_")) %>%
+  as.data.frame()
+
+# Row-wise z-score scaling
+heatmap_scaled <- t(scale(t(heatmap_data)))
+
+# Assign row names using Function column
+rownames(heatmap_scaled) <- metadat_df$Function
+
+# Order alphabetically by functional category
+# Convert Functional_category to alphabetically ordered factor
+category_order <- sort(unique(metadat_df$Functional_category))
+
+metadat_df$Functional_category <- factor(
+  metadat_df$Functional_category,
+  levels = category_order
+)
+
+# Order heatmap rows
+order_idx <- order(metadat_df$Functional_category)
+
+heatmap_scaled <- heatmap_scaled[order_idx, ]
+metadat_df <- metadat_df[order_idx, ]
+
+# Row labels
+formatted_labels <- metadat_df$Function
+
+# Column annotation
+group <- c(rep("Control", 4), rep("Stress", 4))
+
+ha_col <- HeatmapAnnotation(
+  Group = group,
+  
+  col = list(
+    Group = c(
+      Control = "#4D4D4D",
+      Stress  = "#FE8A13"
+    )
+  ),
+  
+  border = TRUE
+)
+```
+
+Export P muris proteins with replicates
+```{r}
+write_xlsx(filtered_rep_df, "p_muris_sig_prot.xlsx")
+```
+
+Coloring for functional categories
+```{r}
+functional_categories <- levels(droplevels(metadat_df$Functional_category))
+
+set.seed(1)
+
+category_colors <- structure(
+  sample(rainbow(length(functional_categories), s = 0.7, v = 0.85)),
+  names = as.character(functional_categories)
+)
+
+category_legend <- Legend(
+  title = "Functional Category",
+  labels = names(category_colors),
+  legend_gp = gpar(fill = category_colors),
+  ncol = 1
+)
+```
+
+Row annotation
+```{r}
+ha_row <- rowAnnotation(
+  Category = metadat_df$Functional_category,
+  
+  col = list(Category = category_colors),
+  
+  border = TRUE,
+  
+  show_annotation_name = FALSE,
+  
+  show_legend = FALSE,
+  
+  annotation_width = unit(3, "mm")
+)
+```
+
+Plot heatmap
+```{r}
+ht <- Heatmap(
+  heatmap_scaled,
+  
+  width = unit(5, "cm"),
+  
+  name = "Z-score",
+  
+  col = viridis(100),
+  
+  top_annotation = ha_col,
+  left_annotation = ha_row,
+  
+  cluster_rows = FALSE,
+  cluster_columns = TRUE,
+  
+  row_split = metadat_df$Functional_category,
+  
+  row_title = NULL,
+  
+  show_row_names = TRUE,
+  
+  row_labels = formatted_labels,
+  
+  row_names_gp = gpar(fontsize = 10),
+  
+  column_names_gp = gpar(fontsize = 10),
+  
+  border = TRUE
+)
+
+# Draw heatmap
+draw(
+  ht,
+  heatmap_legend_side = "left",
+  annotation_legend_side = "left",
+  annotation_legend_list = list(category_legend)
+)
+```
+
+Save heatmap
+```{r}
+pdf(
+  "p_muris_functional_category_heatmap_female_li.pdf",
+  width = 16,
+  height = 8
+)
+
+draw(
+  ht,
+  heatmap_legend_side = "left",
+  annotation_legend_side = "left",
+  annotation_legend_list = list(category_legend)
+)
+
+dev.off()
+```
+
+---------------------- Box and whisker plots for P. muris Pdu proteins (Fig. 4D) ----------------------
+```{r}
+library(tidyverse)
+library(readxl)
+library(ggpubr)
+```
+
+Load in data
+```{r}
+protein_df <- read_excel("female_li_8_2_filtered_hybrid_results_w_function.xlsx", sheet = "p_muris_pro")
+
+# Convert from wide to long format
+protein_long <- protein_df %>%
+  pivot_longer(
+    cols = starts_with("LI_"),
+    names_to = "Sample",
+    values_to = "Intensity"
+  ) %>%
+  mutate(
+    Group = case_when(
+      str_detect(Sample, "Con") ~ "Control",
+      str_detect(Sample, "Strs") ~ "Stress",
+      TRUE ~ NA_character_
+    ),
+    Group = factor(Group, levels = c("Control", "Stress"))
+  )
+```
+
+Choose proteins to plot
+```{r}
+# This order controls the order of the boxplots/facets
+proteins_to_plot <- c(
+  "WP_135987631.1",
+  "WP_135989817.1",
+  "WP_135989873.1",
+  "WP_135989816.1",
+  "WP_135989815.1",
+  "WP_135989814.1",
+  "WP_135987782.1",
+  "WP_135987616.1"
+)
+
+plot_df <- protein_long %>%
+  filter(Protein %in% proteins_to_plot) %>%
+  mutate(
+    Protein = factor(Protein, levels = proteins_to_plot)
+  )
+```
+
+Create ordered facet labels
+```{r}
+facet_order_df <- protein_df %>%
+  filter(Protein %in% proteins_to_plot) %>%
+  distinct(Protein, Function) %>%
+  mutate(
+    Protein = factor(Protein, levels = proteins_to_plot),
+    Plot_Label = Function
+  ) %>%
+  arrange(Protein)
+
+plot_label_order <- facet_order_df$Plot_Label
+
+plot_df <- plot_df %>%
+  left_join(facet_order_df, by = c("Protein", "Function")) %>%
+  mutate(
+    Plot_Label = factor(Plot_Label, levels = plot_label_order)
+  )
+```
+
+Significance labels and brackets
+```{r}
+sig_df <- protein_df %>%
+  filter(Protein %in% proteins_to_plot) %>%
+  mutate(
+    Protein = factor(Protein, levels = proteins_to_plot),
+    sig_label = case_when(
+      adj.P.Val < 0.001 ~ "***",
+      adj.P.Val < 0.01  ~ "**",
+      adj.P.Val < 0.05  ~ "*",
+      TRUE ~ "ns"
+    )
+  ) %>%
+  select(Protein, Function, adj.P.Val, sig_label)
+
+bracket_df <- plot_df %>%
+  group_by(Protein, Function, Plot_Label) %>%
+  summarise(
+    y.position = max(Intensity, na.rm = TRUE) + 
+      0.12 * diff(range(Intensity, na.rm = TRUE)),
+    .groups = "drop"
+  ) %>%
+  left_join(sig_df, by = c("Protein", "Function")) %>%
+  mutate(
+    group1 = "Control",
+    group2 = "Stress",
+    Plot_Label = factor(Plot_Label, levels = plot_label_order)
+  )
+```
+
+Plot
+```{r}
+protein_boxplot <- ggplot(
+  plot_df,
+  aes(
+    x = Group,
+    y = Intensity,
+    fill = Group
+  )
+) +
+  
+  geom_boxplot(
+    width = 0.6,
+    outlier.shape = NA,
+    color = "black",
+    linewidth = 0.7,
+    alpha = 0.85
+  ) +
+  
+  geom_jitter(
+    aes(fill = Group),
+    shape = 21,
+    color = "black",
+    width = 0.12,
+    size = 3.5,
+    stroke = 0.5,
+    alpha = 0.9
+  ) +
+  
+  stat_pvalue_manual(
+    bracket_df,
+    label = "sig_label",
+    xmin = "group1",
+    xmax = "group2",
+    y.position = "y.position",
+    tip.length = 0.01,
+    bracket.size = 0.8,
+    size = 9,
+    hide.ns = FALSE,
+    inherit.aes = FALSE
+  ) +
+  
+  facet_wrap(
+    ~ Plot_Label,
+    scales = "free_y",
+    ncol = 2,
+    
+    # Automatically wrap long facet labels
+    labeller = labeller(
+      Plot_Label = label_wrap_gen(
+        width = 32,
+        multi_line = TRUE
+      )
+    )
+  ) +
+  
+  scale_fill_manual(
+    values = c(
+      "Control" = "#4D4D4D",
+      "Stress"  = "#FE8A13"
+    )
+  ) +
+  
+  scale_color_manual(
+    values = c(
+      "Control" = "#4D4D4D",
+      "Stress"  = "#FE8A13"
+    )
+  ) +
+  
+  # Leave room for brackets and significance labels
+  scale_y_continuous(
+    expand = expansion(
+      mult = c(0.05, 0.20)
+    )
+  ) +
+  
+  labs(
+    x = NULL,
+    y = "Log2-normalized protein intensity",
+    title = paste(
+      "Propanediol metabolism and associated proteins",
+      "from P. muris"
+    )
+  ) +
+  
+  theme_classic(base_size = 20) +
+  
+  theme(
+    # Main title
+    plot.title = element_text(
+      size = 25,
+      face = "bold",
+      hjust = 0.5,
+      lineheight = 1.05,
+      margin = margin(b = 15)
+    ),
+    
+    # Gray facet ribbons
+    strip.background = element_rect(
+      fill = "grey90",
+      color = "black",
+      linewidth = 0.7
+    ),
+    
+    # Wrapped facet text
+    strip.text = element_text(
+      color = "black",
+      face = "bold",
+      size = 17,
+      lineheight = 1,
+      margin = margin(
+        t = 9,
+        r = 8,
+        b = 9,
+        l = 8
+      )
+    ),
+    
+    # Axis text
+    axis.text.x = element_text(
+      color = "black",
+      size = 23,
+      face = "bold"
+    ),
+    
+    axis.text.y = element_text(
+      color = "black",
+      size = 20
+    ),
+    
+    # Axis title
+    axis.title.y = element_text(
+      color = "black",
+      size = 23,
+      face = "bold",
+      margin = margin(r = 12)
+    ),
+    
+    # Legend text
+    legend.position = "top",
+    legend.title = element_text(
+      size = 23,
+      face = "bold"
+    ),
+    legend.text = element_text(
+      size = 23,
+      face = "bold"
+    ),
+    
+    # Spacing between facets
+    panel.spacing = grid::unit(1.2, "lines")
+  )
+
+protein_boxplot
+```
+
+Save plots
+```{r}
+ggsave(
+  filename = "PM_protein_boxplots2.pdf",
+  width = 10,
+  height = 18,
+  dpi = 300
+)
+```
+
+---------------------- GH family heatmap (Fig. S5B & 5E) ----------------------
+Plot select data as a heatmap with replicates per group
+Load in packages
+```{r}
+library(readxl)
+library(dplyr)
+library(ComplexHeatmap)
+library(circlize)
+library(viridis)
+library(grid)
+library(gridtext)
+library(stringr)
+library(scales)
+```
+
+Load in data from excel spread sheets
+```{r}
+rep_df <- read_excel("f_li_imputed_values.xlsx")
+metadat_df <- read_excel("female_li_results_w_function.xlsx", sheet = "complx_carb_ferm_selected")
+```
+
+Filter imputed values to only proteins of interest for plotting
+```{r}
+filtered_rep_df <- rep_df %>%
+  filter(Protein %in% metadat_df$Protein)
+# Match order between sheets to align metadata (safer ordering)
+filtered_rep_df <- filtered_rep_df %>%
+  slice(match(metadat_df$Protein, Protein))
+```
+
+Create dataframe that will be plotted as a heatmap
+```{r}
+heatmap_data <- filtered_rep_df %>%
+  select(starts_with("LI_")) %>%
+  as.data.frame()
+
+# Row-wise z-score scaling
+heatmap_scaled <- t(scale(t(heatmap_data)))
+
+# Assign row names
+rownames(heatmap_scaled) <- metadat_df$name
+```
+
+Order data by GH family
+```{r}
+# Manually define GH family order
+gh_order <- c(
+  "GH1",
+  "GH2",
+  "GH3",
+  "GH13",
+  "GH29",
+  "GH30",
+  "GH31",
+  "GH32",
+  "GH36",
+  "GH38",
+  "GH42",
+  "GH43",
+  "GH51"
+)
+# Convert to a factor
+metadat_df$`GH family` <- factor(
+  metadat_df$`GH family`,
+  levels = gh_order
+)
+# Order heatmap rows
+order_idx <- order(metadat_df$`GH family`)
+
+heatmap_scaled <- heatmap_scaled[order_idx, ]
+metadat_df <- metadat_df[order_idx, ]
+```
+
+Create italicized labels
+```{r}
+formatted_labels <- sapply(metadat_df$name, function(x) {
+
+  parts <- strsplit(x, " - ")[[1]]
+
+  species <- parts[1]
+
+  remainder <- ifelse(length(parts) > 1,
+                      paste(parts[-1], collapse = " - "),
+                      "")
+
+  paste0("<i>", species, "</i> - ", remainder)
+})
+```
+
+Annotate columns
+```{r}
+group <- c(rep("Control", 4), rep("Stress", 4))
+
+ha_col <- HeatmapAnnotation(
+  Group = group,
+  
+  col = list(
+    Group = c(
+      Control = "#4D4D4D",
+      Stress = "#FE8A13"
+    )
+  ),
+  
+  border = TRUE
+)
+```
+
+GH family coloring
+```{r}
+gh_families <- levels(droplevels(metadat_df$`GH family`))
+
+set.seed(1)
+
+gh_colors <- structure(
+  sample(rainbow(length(gh_families), s = 0.7, v = 0.85)),
+  names = as.character(gh_families)
+)
+
+gh_legend <- Legend(
+  title = "GH Family",
+  labels = names(gh_colors),
+  legend_gp = gpar(fill = gh_colors),
+  ncol = 1
+)
+```
+
+Row annotation
+```{r}
+ha_row <- rowAnnotation(
+  GH = metadat_df$`GH family`,
+
+  col = list(GH = gh_colors),
+
+  border = TRUE, 
+  
+  show_annotation_name = FALSE,
+
+  show_legend = FALSE,
+
+  annotation_width = unit(3, "mm")
+)
+```
+
+Plot the heatmap using viridis
+```{r}
+ht <- Heatmap(
+  heatmap_scaled,
+
+  width = unit(5, "cm"),
+  
+  name = "Z-score",
+
+  col = viridis(100),
+
+  top_annotation = ha_col,
+  left_annotation = ha_row,
+
+  cluster_rows = FALSE,
+  cluster_columns = TRUE,
+
+  row_split = metadat_df$`GH family`,
+
+  row_title = NULL,
+
+  show_row_names = TRUE,
+
+  row_labels = gt_render(formatted_labels),
+
+  row_names_gp = gpar(fontsize = 10),
+
+  column_names_gp = gpar(fontsize = 10),
+
+  border = TRUE
+)
+```
+
+Draw heatmap
+```{r}
+draw(
+  ht,
+  heatmap_legend_side = "left",
+  annotation_legend_side = "left",
+  annotation_legend_list = list(gh_legend)
+)
+```
+
+Save heat map as a PDF
+```{r}
+pdf(
+  "GH_family_heatmap_female_li.pdf",
+  width = 12,
+  height = 6
+)
+
+draw(
+  ht,
+  heatmap_legend_side = "left",
+  annotation_legend_side = "left",
+  annotation_legend_list = list(gh_legend)
+)
+
+dev.off()
+```
+
+---------------------- Arabinose isomerases (Fig. 5F) ----------------------
+```{r}
+library(readxl)
+library(tidyverse)
+library(ggnewscale)
+library(ggpubr)
+```
+
+Replicate data
+```{r}
+# Create data frame: one row per arabinose isomerase protein
+arab_iso_wide <- data.frame(
+  Protein = paste0("Arab_iso_", 1:4),
+  
+  LI_1R = c(26.59014836, 22.86847361, 25.23974988, 22.86847361),
+  LI_3R = c(24.79358207, 24.47970457, 22.85565239, 21.33416101),
+  LI_3L = c(24.4231736,  22.78263954, 26.44463167, 24.22227051),
+  LI_3N = c(25.25789375, 23.64587049, 26.58626664, 23.34719595),
+  
+  LI_5 = c(16.66645673, 15.73025679, 18.50922405, 11.03458458),
+  LI_6 = c(16.56972194, 16.60577156, 19.67905462, 13.64283085),
+  LI_7 = c(17.08305329, 23.01987789, 21.02644166, 12.81229335),
+  LI_12 = c(24.74865467, 15.79208467, 18.56204975, 12.69349201)
+)
+
+# Convert to long format
+arab_iso_long <- arab_iso_wide %>%
+  pivot_longer(
+    cols = starts_with("LI_"),
+    names_to = "Sample",
+    values_to = "Log2_Intensity"
+  ) %>%
+  mutate(
+    Group = case_when(
+      str_detect(Sample, "Con") ~ "Control",
+      str_detect(Sample, "Strs") ~ "Stress",
+      TRUE ~ NA_character_
+    ),
+    Group = factor(Group, levels = c("Control", "Stress")),
+    Protein = factor(Protein, levels = paste0("Arab_iso_", 1:4))
+  )
+```
+
+Connected mean summary lines
+```{r}
+arab_iso_summary <- arab_iso_long %>%
+  group_by(Protein, Group) %>%
+  summarise(
+    Mean_Log2_Intensity = mean(Log2_Intensity, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+Plot
+```{r}
+arab_iso_connected_plot <- ggplot() +
+  
+  # Replicate dots: original darker colors
+  geom_jitter(
+    data = arab_iso_long,
+    aes(
+      x = Group,
+      y = Log2_Intensity,
+      fill = Group
+    ),
+    shape = 21,
+    color = "black",
+    width = 0.16,
+    size = 5,
+    stroke = 0.4,
+    alpha = 0.95
+  ) +
+  
+    scale_fill_manual(
+    values = c(
+      "Control" = "#BDBDBD",
+      "Stress"  = "#FDBA74"
+    )
+  ) +
+  
+  ggnewscale::new_scale_fill() +
+  
+  # Faint connected protein-level mean lines
+  geom_line(
+    data = arab_iso_summary,
+    aes(
+      x = Group,
+      y = Mean_Log2_Intensity,
+      group = Protein
+    ),
+    color = "gray45",
+    linewidth = 0.7,
+    alpha = 0.5
+  ) +
+  
+  # Mean points: lighter colors and drawn last
+  geom_point(
+    data = arab_iso_summary,
+    aes(
+      x = Group,
+      y = Mean_Log2_Intensity,
+      fill = Group
+    ),
+    shape = 21,
+    color = "black",
+    size = 6.5,
+    stroke = 0.7,
+    alpha = 0.85
+  ) +
+  
+  scale_fill_manual(
+    values = c(
+      "Control" = "#4D4D4D",
+      "Stress"  = "#FE8A13"
+    )
+  ) +
+  
+  labs(
+    title = "L-arabinose isomerase LI F",
+    x = NULL,
+    y = "Log2 intensity"
+  ) +
+  
+  theme_classic(base_size = 20) +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,
+      face = "bold",
+      size = 25
+    ),
+    axis.text.x = element_text(
+      color = "black",
+      face = "bold",
+      size = 23
+    ),
+    axis.text.y = element_text(
+      color = "black",
+      size = 23
+    ),
+    axis.title.y = element_text(
+      color = "black",
+      face = "bold",
+      size = 25
+    ),
+    legend.position = "none"
+  )
+
+arab_iso_connected_plot
+```
+
+Save plot
+```{r}
+ggsave(
+  filename = "f_li_arabinose_isomerase_plot.pdf",
+  plot = arab_iso_connected_plot,
+  width = 6,
+  height = 6
+)
+```
+
+---------------------- Xylose isomerases (Fig. 5G) ----------------------
+```{r}
+library(readxl)
+library(tidyverse)
+library(ggnewscale)
+library(ggpubr)
+```
+
+Create data frame
+```{r}
+xylose_iso_wide <- data.frame(
+  Protein = c(
+    "A. muris",
+    "A. chartisolvens"
+  ),
+  
+  LI_1R = c(22.76354405, 10.10437185),
+  LI_3R = c(22.85565239, 12.84485678),
+  LI_3L = c(21.9862123,  8.472315183),
+  LI_3N = c(21.98477853, 10.01343091),
+  
+  LI_5 = c(15.67163703, 22.76231867),
+  LI_6 = c(16.64836058, 22.83457254),
+  LI_7 = c(19.46889062, 23.24084031),
+  LI_12 = c(16.59677043, 23.26018572)
+)
+
+# Convert to long format
+xylose_iso_long <- xylose_iso_wide %>%
+  pivot_longer(
+    cols = starts_with("LI_"),
+    names_to = "Sample",
+    values_to = "Log2_Intensity"
+  ) %>%
+  mutate(
+    Group = case_when(
+      str_detect(Sample, "Con") ~ "Control",
+      str_detect(Sample, "Strs") ~ "Stress",
+      TRUE ~ NA_character_
+    ),
+    Group = factor(Group, levels = c("Control", "Stress")),
+    Protein = factor(
+      Protein,
+      levels = c(
+        "A. muris",
+        "A. chartisolvens"
+      )
+    )
+  )
+```
+
+Create a sig bracket dataframe
+```{r}
+bracket_df <- xylose_iso_long %>%
+  group_by(Protein) %>%
+  summarise(
+    y.position = max(Log2_Intensity, na.rm = TRUE) + 1,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    group1 = "Control",
+    group2 = "Stress",
+    label = c("**", "***")
+  )
+```
+
+Plot
+```{r}
+xylose_barplot <- ggplot(
+  xylose_iso_long,
+  aes(x = Group, y = Log2_Intensity, fill = Group)
+) +
+  stat_summary(
+    fun = mean,
+    geom = "bar",
+    width = 0.65,
+    color = "black",
+    linewidth = 0.6,
+    alpha = 0.85
+  ) +
+  stat_summary(
+    fun.data = mean_se,
+    geom = "errorbar",
+    width = 0.18,
+    linewidth = 0.6,
+    color = "black"
+  ) +
+  
+  # Control replicate dots: darker gray with black border
+  geom_jitter(
+    data = xylose_iso_long %>% filter(Group == "Control"),
+    aes(x = Group, y = Log2_Intensity),
+    inherit.aes = FALSE,
+    shape = 21,
+    fill = "#4D4D4D",
+    color = "black",
+    stroke = 0.4,
+    width = 0.08,
+    size = 4.5,
+    alpha = 0.95
+  ) +
+  
+  # Stress replicate dots: darker orange with black border
+  geom_jitter(
+    data = xylose_iso_long %>% filter(Group == "Stress"),
+    aes(x = Group, y = Log2_Intensity),
+    inherit.aes = FALSE,
+    shape = 21,
+    fill = "#FE8A13",
+    color = "black",
+    stroke = 0.4,
+    width = 0.08,
+    size = 4.5,
+    alpha = 0.95
+  ) +
+  
+    stat_pvalue_manual(
+    bracket_df,
+    label = "label",
+    xmin = "group1",
+    xmax = "group2",
+    y.position = "y.position",
+    tip.length = 0.01,
+    bracket.size = 0.6,
+    size = 8,
+    inherit.aes = FALSE
+  ) +
+  
+  facet_wrap(
+    ~ Protein,
+    scales = "free_y",
+    nrow = 1
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Control" = "#BDBDBD",
+      "Stress"  = "#FDBA74"
+    )
+  ) +
+  labs(
+    x = NULL,
+    y = "Log2 intensity",
+    title = "Xylose isomerase LI F"
+  ) +
+  theme_classic(base_size = 20) +
+  theme(
+    strip.background = element_rect(
+      fill = "gray90",
+      color = "black",
+      linewidth = 0.5
+    ),
+    strip.text = element_text(
+      face = "italic",
+      color = "black",
+      size = 18
+    ),
+    axis.text.x = element_text(
+      color = "black",
+      face = "bold",
+      size = 23,
+      hjust = 1,
+      angle = 45
+    ),
+    axis.text.y = element_text(color = "black", size = 23),
+    axis.title.y = element_text(color = "black", face = "bold", size = 25),
+    plot.title = element_text(
+      face = "bold",
+      hjust = 0.5,
+      size = 25
+    ),
+    legend.position = "none",
+    panel.border = element_rect(
+      color = "black",
+      fill = NA,
+      linewidth = 0.6
+    )
+  )
+
+xylose_barplot
+```
+
+Save plot
+```{r}
+ggsave(
+  filename = "f_li_xylose_isomerase_plot.pdf",
+  plot = xylose_barplot,
+  width = 6,
+  height = 6
+)
+```
